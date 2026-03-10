@@ -7,7 +7,11 @@ from app.models.models import SubmittedFile, Report, Call, ChecklistItem, Report
 from app.services.storage import storage_service
 from app.services.pdf_parsing import pdf_parsing_service
 from app.services.checklist import checklist_service
-from app.schemas.schemas import ApplicationPackageCreate, ApplicationPackageSchema, CallDocumentSchema, CallSchema, ChecklistItemSchema, ChecklistItemBase
+from app.schemas.schemas import (
+    ApplicationPackageCreate, ApplicationPackageSchema, CallDocumentSchema, 
+    CallSchema, ChecklistItemSchema, ChecklistItemBase, CallCreate, 
+    ChecklistItemUpdate, ReportSchema
+)
 import hashlib
 import io
 
@@ -178,6 +182,10 @@ async def generate_report(package_id: int, db: Session = Depends(get_db)):
             checklist_item_id=finding["checklist_item_id"],
             status=finding["status"],
             evidence=finding["explanation"],
+            package_evidence=finding.get("package_evidence"),
+            source_document_title=finding.get("source_document_title"),
+            source_section=finding.get("source_section"),
+            source_passage=finding.get("source_passage"),
             page_number=finding.get("page_number")
         )
         db.add(db_finding)
@@ -211,6 +219,19 @@ async def get_call(call_id: int, db: Session = Depends(get_db)):
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
     return call
+
+@router.post("/calls", response_model=CallSchema)
+async def create_call(call_in: CallCreate, db: Session = Depends(get_db)):
+    # Check if code already exists
+    existing = db.query(Call).filter(Call.code == call_in.code).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Call code already exists")
+    
+    db_call = Call(**call_in.model_dump())
+    db.add(db_call)
+    db.commit()
+    db.refresh(db_call)
+    return db_call
 
 @router.post("/calls/{call_id}/documents", response_model=CallDocumentSchema)
 async def upload_call_document(
@@ -276,6 +297,18 @@ async def create_call_rule(call_id: int, rule_in: ChecklistItemBase, db: Session
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
     
+    # Validate source_document_id if provided
+    if rule_in.source_document_id:
+        source_doc = db.query(CallDocument).filter(
+            CallDocument.id == rule_in.source_document_id,
+            CallDocument.call_id == call_id
+        ).first()
+        if not source_doc:
+            raise HTTPException(
+                status_code=400, 
+                detail="Source document not found or belongs to another call."
+            )
+
     # Create rule
     db_rule = ChecklistItem(
         call_id=call_id,
@@ -285,6 +318,47 @@ async def create_call_rule(call_id: int, rule_in: ChecklistItemBase, db: Session
     db.commit()
     db.refresh(db_rule)
     return db_rule
+
+@router.put("/rules/{rule_id}", response_model=ChecklistItemSchema)
+async def update_call_rule(rule_id: int, rule_in: ChecklistItemUpdate, db: Session = Depends(get_db)):
+    db_rule = db.query(ChecklistItem).filter(ChecklistItem.id == rule_id).first()
+    if not db_rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    
+    update_data = rule_in.model_dump(exclude_unset=True)
+    
+    # Validate source_document_id if provided
+    if "source_document_id" in update_data and update_data["source_document_id"] is not None:
+        source_doc = db.query(CallDocument).filter(
+            CallDocument.id == update_data["source_document_id"],
+            CallDocument.call_id == db_rule.call_id
+        ).first()
+        if not source_doc:
+            raise HTTPException(
+                status_code=400, 
+                detail="Source document not found or belongs to another call."
+            )
+
+    for key, value in update_data.items():
+        setattr(db_rule, key, value)
+    
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+@router.delete("/rules/{rule_id}")
+async def delete_call_rule(rule_id: int, db: Session = Depends(get_db)):
+    db_rule = db.query(ChecklistItem).filter(ChecklistItem.id == rule_id).first()
+    if not db_rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    
+    db.delete(db_rule)
+    db.commit()
+    return {"detail": "Rule deleted"}
+
+@router.get("/packages", response_model=List[ApplicationPackageSchema])
+async def list_packages(db: Session = Depends(get_db)):
+    return db.query(ApplicationPackage).all()
 
 @router.get("/calls/{call_id}/documents", response_model=List[CallDocumentSchema])
 async def list_call_documents(call_id: int, db: Session = Depends(get_db)):

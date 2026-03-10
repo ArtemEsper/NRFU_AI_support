@@ -83,27 +83,37 @@ class PdfParsingService:
 
     def _extract_project_title(self, text: str) -> str:
         # Heuristic: search for "Назва проєкту" or "Project title"
-        head = text[:2000]
-        uk_pattern = r"(?:Назва проєкту|НАЗВА ПРОЄКТУ)[:\s]*([^\n\r]+)"
-        en_pattern = r"(?:Project title|PROJECT TITLE)[:\s]*([^\n\r]+)"
+        # NRFU PDFs often have project titles after a label on the same line or next line
+        head = text[:3000]
+        # Common NRFU labels
+        labels = [
+            r"Назва проєкту", r"НАЗВА ПРОЄКТУ", 
+            r"Project title", r"PROJECT TITLE",
+            r"Назва теми проєкту", r"НАЗВА ТЕМИ ПРОЄКТУ"
+        ]
         
-        match = re.search(uk_pattern, head)
-        if not match:
-            match = re.search(en_pattern, head)
+        for label in labels:
+            # Try to find the label and the text following it on the same line
+            pattern = rf"{label}[:\s]*([^\n\r]+)"
+            match = re.search(pattern, head, re.IGNORECASE)
+            if match:
+                extracted = match.group(1).strip()
+                if len(extracted) > 5:  # Avoid matching empty or very short strings
+                    return extracted
+            
+            # If not found on the same line, try the next line
+            # Look for the label followed by a newline and then the title
+            pattern_next_line = rf"{label}[:\s]*[\n\r]+([^\n\r]+)"
+            match = re.search(pattern_next_line, head, re.IGNORECASE)
+            if match:
+                extracted = match.group(1).strip()
+                if len(extracted) > 5:
+                    return extracted
 
-        if not match:
-            match = re.search(uk_pattern, head, re.IGNORECASE)
-            if not match:
-                match = re.search(en_pattern, head, re.IGNORECASE)
-            
-        if match:
-            extracted = match.group(1).strip()
-            if extracted:
-                return extracted
-            
-        if "Назва проєкту" in head or "НАЗВА ПРОЄКТУ" in head:
+        # Fallback keyword presence
+        if any(l.replace(r"", "") in head for l in ["Назва проєкту", "НАЗВА ПРОЄКТУ"]):
             return "Detected (Ukrainian)"
-        if "Project title" in head or "PROJECT TITLE" in head:
+        if any(l.replace(r"", "") in head for l in ["Project title", "PROJECT TITLE"]):
             return "Detected (English)"
             
         return None

@@ -105,6 +105,18 @@ class ChecklistItemBase(BaseModel):
     source_section: Optional[str] = None
     is_active: bool = True
 
+class ChecklistItemCreate(ChecklistItemBase):
+    pass
+
+class ChecklistItemUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    rule_code: Optional[str] = None
+    severity: Optional[str] = None
+    source_document_id: Optional[int] = None
+    source_section: Optional[str] = None
+    is_active: Optional[bool] = None
+
 class ChecklistItemSchema(ChecklistItemBase):
     id: int
     call_id: int
@@ -123,10 +135,14 @@ class ReportBase(BaseModel):
 class ReportFindingSchema(BaseModel):
     id: int
     report_id: int
-    file_id: int
+    file_id: Optional[int] = None
     checklist_item_id: int
     status: str
     evidence: Optional[str] = None
+    package_evidence: Optional[str] = None
+    source_document_title: Optional[str] = None
+    source_section: Optional[str] = None
+    source_passage: Optional[str] = None
     page_number: Optional[int] = None
     created_at: datetime
 

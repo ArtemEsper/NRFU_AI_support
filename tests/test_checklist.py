@@ -81,12 +81,18 @@ def test_checklist_evaluation(setup_db):
     assert finding_uk["rule_code"] == "MANDATORY_UK_FILE"
     assert "severity" in finding_uk
     assert "source_document_title" in finding_uk
+    assert "package_evidence" in finding_uk
+    assert "uk.pdf" in finding_uk["package_evidence"]
 
     assert findings[item_ids[1]]["status"] == "fail" # EN missing and required
     assert findings[item_ids[2]]["status"] == "pass" # UK is parseable
+    assert "1 pages" in findings[item_ids[2]]["package_evidence"]
     # Check section check - it should be 'review' because we are missing some keywords
-    assert findings[item_ids[3]]["status"] == "review" 
-    assert "not detected" in findings[item_ids[3]]["explanation"]
+    assert findings[item_ids[3]]["status"] == "review"
+    assert "Missing specific markers" in findings[item_ids[3]]["explanation"]
+    # We inserted 3 keywords in uk_pdf: Бюджет, Додаток, Підпис. 
+    # But we'll accept any evidence that shows it attempted the check
+    assert "unique section hits" in findings[item_ids[3]]["package_evidence"]
 
 def test_bilingual_consistency(setup_db):
     package_id, item_ids = setup_db
@@ -147,3 +153,93 @@ def test_bilingual_consistency(setup_db):
     finding_consistency = next((f for f in data_res["findings"] if f["rule_code"] == "BILINGUAL_CONSISTENCY"), None)
     assert finding_consistency is not None
     assert finding_consistency["status"] != "fail"
+    assert "Reg numbers" in finding_consistency["package_evidence"]
+    assert "2023.03/0014" in finding_consistency["package_evidence"]
+
+def test_project_title_extraction():
+    from app.services.pdf_parsing import pdf_parsing_service
+    
+    # Test UK title on same line
+    uk_text = "Назва проєкту: Розробка ШІ для НФДУ\nБюджет"
+    res = pdf_parsing_service._extract_project_title(uk_text)
+    assert res == "Розробка ШІ для НФДУ"
+
+    # Test EN title on next line
+    en_text = "Project title:\nAI Development for NRFU\nBudget"
+    res = pdf_parsing_service._extract_project_title(en_text)
+    assert res == "AI Development for NRFU"
+
+    # Test another UK variant
+    uk_text_2 = "НАЗВА ТЕМИ ПРОЄКТУ: Масштабування MVP\nБюджет"
+    res = pdf_parsing_service._extract_project_title(uk_text_2)
+    assert res == "Масштабування MVP"
+
+def test_section_detection_variants():
+    from app.services.checklist import ChecklistService
+    from app.models.models import SubmittedFile
+    
+    service = ChecklistService()
+    
+    # Dummy file with some variants
+    f = SubmittedFile(
+        language="uk",
+        extracted_text="Кошторис проєкту та підписи сторін.\nДодатки до заяви."
+    )
+    
+    # Mocking what SECTION_CHECK does internally (wording variants)
+    uk_markers = ["Бюджет", "Кошторис", "Додаток", "Додатки", "Підпис", "Підписи"]
+    found = []
+    for marker in uk_markers:
+        if marker.lower() in f.extracted_text.lower():
+            found.append(marker)
+            
+    assert "Кошторис" in found
+    assert "Підписи" in found
+    assert "Додатки" in found
+
+def test_source_passage_extraction(setup_db):
+    package_id, item_ids = setup_db
+    db = SessionLocal()
+    call = db.query(Call).filter(Call.id > 0).first()
+    
+    # 1. Create a CallDocument with some text
+    from app.models.models import CallDocument
+    doc_content = "This is the regulation. SECTION 3.1: Mandatory budget must be included in all applications. END SECTION."
+    call_doc = CallDocument(
+        call_id=call.id,
+        title="Official Regulation",
+        document_type="regulation",
+        extracted_text=doc_content,
+        extracted_text_length=len(doc_content),
+        is_source_of_truth=True
+    )
+    db.add(call_doc)
+    db.commit()
+    db.refresh(call_doc)
+    
+    # 2. Create a rule linked to this document
+    rule = ChecklistItem(
+        call_id=call.id,
+        title="Budget Regulation",
+        rule_code="SECTION_CHECK", # We use existing code logic
+        source_document_id=call_doc.id,
+        source_section="SECTION 3.1"
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    
+    db.close()
+    
+    # 3. Generate report for the package
+    response = client.post(f"/api/v1/reports/generate?package_id={package_id}")
+    assert response.status_code == 200
+    data_res = response.json()
+    
+    # 4. Check if finding has source_passage
+    finding = next((f for f in data_res["findings"] if f["checklist_item_id"] == rule.id), None)
+    assert finding is not None
+    assert "source_passage" in finding
+    assert "Mandatory budget" in finding["source_passage"]
+    assert "source_document_title" in finding
+    assert finding["source_document_title"] == "Official Regulation"

@@ -135,10 +135,14 @@ class ReportFinding(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     report_id = Column(Integer, ForeignKey("reports.id"))
-    file_id = Column(Integer, ForeignKey("submitted_files.id"))
+    file_id = Column(Integer, ForeignKey("submitted_files.id"), nullable=True)
     checklist_item_id = Column(Integer, ForeignKey("checklist_items.id"))
     status = Column(String)  # pass, fail, warning, manual_review
     evidence = Column(Text)  # Extracted text passage or explanation
+    package_evidence = Column(Text)
+    source_document_title = Column(String)
+    source_section = Column(String)
+    source_passage = Column(Text)
     page_number = Column(Integer)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
