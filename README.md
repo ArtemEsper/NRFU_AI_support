@@ -86,20 +86,8 @@ curl -X POST "http://localhost:8000/api/v1/calls" \
 ```
 *Note the returned `"id"` (e.g., `3`).*
 
-**2. Add Rules to the Call**
-A new call has no rules by default. You must add at least the mandatory rules:
-```bash
-curl -X POST "http://localhost:8000/api/v1/calls/3/rules" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "title": "Mandatory Ukrainian PDF",
-       "rule_code": "MANDATORY_UK_FILE",
-       "severity": "critical"
-     }'
-```
-*(Repeat for other rule codes like `CONDITIONAL_EN_FILE`, `SECTION_CHECK`, etc.)*
-
-**3. Upload Authoritative Documents (Optional Grounding)**
+**2. Upload Authoritative Documents (Optional Grounding)**
+Before you can ground your rules, you need to upload the authoritative documents for the call. Note the returned document `"id"` (e.g., `1`).
 ```bash
 curl -X POST "http://localhost:8000/api/v1/calls/3/documents" \
      -F "title=Official Call Conditions" \
@@ -107,6 +95,21 @@ curl -X POST "http://localhost:8000/api/v1/calls/3/documents" \
      -F "is_source_of_truth=true" \
      -F "file=@regulations.pdf"
 ```
+
+**3. Add Rules to the Call**
+A new call has no rules by default. You can add rules with full grounding (linking them to the document ID from Step 2) or minimal fields:
+```bash
+curl -X POST "http://localhost:8000/api/v1/calls/3/rules" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "title": "Mandatory Ukrainian PDF",
+       "rule_code": "MANDATORY_UK_FILE",
+       "severity": "critical",
+       "source_document_id": 1,
+       "source_section": "Section 3.1"
+     }'
+```
+*(Repeat for other rule codes like `CONDITIONAL_EN_FILE`, `SECTION_CHECK`, etc. The `source_document_id` and `source_section` are optional at creation but recommended for grounded reporting.)*
 
 ---
 
@@ -146,7 +149,7 @@ curl -X POST "http://localhost:8000/api/v1/reports/generate?package_id=1"
     curl -X GET "http://localhost:8000/api/v1/calls/1/rules"
     ```
     
-    Add a custom rule to a call:
+    Add a custom rule to a call (with grounding):
     ```bash
     curl -X POST "http://localhost:8000/api/v1/calls/1/rules" \
          -H "Content-Type: application/json" \
@@ -160,6 +163,8 @@ curl -X POST "http://localhost:8000/api/v1/reports/generate?package_id=1"
            "is_active": true
          }'
     ```
+
+    Note: You can create rules with all fields at once, or create them with minimal fields and update them later.
 
     Update an existing rule (e.g., to link it to a source document):
     ```bash
