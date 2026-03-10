@@ -76,7 +76,12 @@ def test_checklist_evaluation(setup_db):
     # Check specific findings
     findings = {f["checklist_item_id"]: f for f in data_res["findings"]}
     
-    assert findings[item_ids[0]]["status"] == "pass" # UK present
+    finding_uk = findings[item_ids[0]]
+    assert finding_uk["status"] == "pass" # UK present
+    assert finding_uk["rule_code"] == "MANDATORY_UK_FILE"
+    assert "severity" in finding_uk
+    assert "source_document_title" in finding_uk
+
     assert findings[item_ids[1]]["status"] == "fail" # EN missing and required
     assert findings[item_ids[2]]["status"] == "pass" # UK is parseable
     # Check section check - it should be 'review' because we are missing some keywords
@@ -135,14 +140,10 @@ def test_bilingual_consistency(setup_db):
     assert response.status_code == 200
     data_res = response.json()
     
-    # Check specific findings
-    findings = {f["checklist_item_id"]: f for f in data_res["findings"]}
-    
     # Consistency check should pass if both reg numbers match and titles are present
     # Even if they don't semantically match (we don't check that yet)
-    # assert findings[consistency_item.id]["status"] == "pass"
-    # assert "consistency check passed" in findings[consistency_item.id]["explanation"].lower()
     
-    # Actually, due to heuristic extraction issues in tests, it might be 'review'.
-    # We want to verify it's NOT 'fail' if both files are present.
-    assert findings[consistency_item.id]["status"] != "fail"
+    # Actually, we should find the finding by rule_code since IDs might vary
+    finding_consistency = next((f for f in data_res["findings"] if f["rule_code"] == "BILINGUAL_CONSISTENCY"), None)
+    assert finding_consistency is not None
+    assert finding_consistency["status"] != "fail"

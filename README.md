@@ -4,12 +4,16 @@ This is an MVP for the National Research Foundation of Ukraine (NRFU) to support
 
 ## Core Features
 
-- **Package-Centric Submission**: Group multiple files (UK/EN) under a single `ApplicationPackage`.
-- **Call-Level Metadata & Authoritative Documents**:
-  - **Operational Metadata**: Tracks `applications_received_count`, `applications_expected_count`, deadlines, and status per `Call`.
-  - **Authoritative Call Documents**: Support for uploading and storing official call regulations, templates, and manuals (Source of Truth).
-  - **Extracted Text Storage**: All call documents are parsed and full text is stored to enable future RAG-based grounding.
-- **Enhanced PDF Ingestion**:
+1.  **Package-Centric Submission**: Group multiple files (UK/EN) under a single `ApplicationPackage`.
+2.  **Call-Level Metadata & Authoritative Documents**:
+    -   **Operational Metadata**: Tracks `applications_received_count`, `applications_expected_count`, deadlines, and status per `Call`.
+    -   **Authoritative Call Documents**: Support for uploading and storing official call regulations, templates, and manuals (Source of Truth).
+    -   **Extracted Text Storage**: All call documents are parsed and full text is stored to enable future RAG-based grounding.
+3.  **Call-Specific Rule Definitions (Grounded Evaluation)**:
+    -   **Rule Modeling**: Rules are explicitly linked to a `Call` and can point to a `CallDocument` (e.g., a specific Regulation PDF) as their source of truth.
+    -   **Metadata**: Each rule includes a `rule_code`, `severity` (critical, major, minor), and `source_section` (e.g., "Section 3.1").
+    -   **Source-Linked Findings**: Reports now include references to the authoritative documents and sections that define each rule.
+4.  **Enhanced PDF Ingestion**:
   - **Full-Text Extraction**: Preserves the entire extracted text for full-document rule evaluation.
   - **Heuristic Metadata Extraction**: Automatically detects project registration numbers, call titles, and project titles using deterministic regex and keyword matching.
   - **Validation**: Ensures files are valid PDFs, checks for minimum text length, and prevents duplicate uploads for the same language.
@@ -18,7 +22,10 @@ This is an MVP for the National Research Foundation of Ukraine (NRFU) to support
   - **Conditional English Checks**: Enforces English mirror requirement based on Funding Call rules.
   - **Bilingual Consistency**: Checks if registration numbers and titles match or are present in both Ukrainian and English files.
   - **Full-Text Section Detection**: Scans the entire document for NRFU-specific markers (e.g., "Реєстраційний номер проєкту", "Назва конкурсу", "Бюджет", "Додаток", "Підпис").
-- **Structured Reporting**: Generates a detailed JSON report including package metadata, extracted file info, per-rule findings, and an overall status (`pass`, `fail`, `review`).
+- **Call-Specific Reporting**: 
+  - Generates a detailed JSON report including package metadata, extracted file info, and per-rule findings.
+  - **Source References**: Each finding in the report includes the `severity`, `rule_text`, and links to the `source_document_title` and `source_section`.
+  - **Overall Status**: Calculates a final status (`pass`, `fail`, `review`) based on rule outcomes.
 
 ## Getting Started
 
@@ -54,9 +61,9 @@ docker compose exec app python scripts/seed_data.py
 ```
 
 After seeding, you will have:
-- `call_id: 1` (CALL-UK-2024): Ukrainian-only call with metadata (deadlines, expected counts).
+- `call_id: 1` (CALL-UK-2024): Ukrainian-only call with metadata (deadlines, expected counts) and a linked **Source of Truth** document.
 - `call_id: 2` (CALL-BI-2024): Bilingual call (requires English mirror) with metadata.
-- All standard checklist rules (Mandatory UK, Conditional EN, Parseability, Sections, Consistency) attached to both.
+- All standard checklist rules (Mandatory UK, Conditional EN, Parseability, Sections, Consistency) attached to both, with severity levels and source-linked sections for `call_id: 1`.
 
 Alternatively, you can manually seed via SQL if needed:
 ```bash
@@ -95,7 +102,27 @@ curl -X POST "http://localhost:8000/api/v1/packages/1/upload" \
 curl -X POST "http://localhost:8000/api/v1/reports/generate?package_id=1"
 ```
 
-### 5. Manage Call Documents (Authoritative Sources)
+### 5. Call Rules Management
+List all rules for a call:
+```bash
+curl -X GET "http://localhost:8000/api/v1/calls/1/rules"
+```
+
+Add a custom rule to a call:
+```bash
+curl -X POST "http://localhost:8000/api/v1/calls/1/rules" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "title": "Specific Section Check",
+       "description": "Check for a very specific project section.",
+       "rule_code": "CUSTOM_SECTION_X",
+       "severity": "major",
+       "source_section": "Annex 4",
+       "is_active": true
+     }'
+```
+
+### 6. Manage Call Documents (Authoritative Sources)
 Upload official regulations or templates to a specific `Call`.
 ```bash
 curl -X POST "http://localhost:8000/api/v1/calls/1/documents" \

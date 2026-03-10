@@ -1,6 +1,6 @@
 from typing import List, Dict, Any
-from sqlalchemy.orm import Session
-from app.models.models import SubmittedFile, Call, ApplicationPackage, ChecklistItem, ReportFinding, Report
+from sqlalchemy.orm import Session, joinedload
+from app.models.models import SubmittedFile, Call, ApplicationPackage, ChecklistItem, ReportFinding, Report, CallDocument
 from app.core.logger import logger
 
 class ChecklistService:
@@ -11,13 +11,18 @@ class ChecklistService:
         """
         logger.info(f"Evaluating checklist for call {call_id} and package {package_id}")
         
-        # 1. Fetch the call and its checklist items
+        # 1. Fetch the call and its active checklist items
         call = db.query(Call).filter(Call.id == call_id).first()
         if not call:
             logger.error(f"Call {call_id} not found")
             return []
             
-        checklist_items = db.query(ChecklistItem).filter(ChecklistItem.call_id == call_id).all()
+        checklist_items = (
+            db.query(ChecklistItem)
+            .options(joinedload(ChecklistItem.source_document))
+            .filter(ChecklistItem.call_id == call_id, ChecklistItem.is_active == True)
+            .all()
+        )
         
         # 2. Fetch the package and its files
         package = db.query(ApplicationPackage).filter(ApplicationPackage.id == package_id).first()
@@ -192,7 +197,14 @@ class ChecklistService:
                 "status": status,
                 "explanation": explanation,
                 "file_id": file_id,
-                "page_number": page_number
+                "page_number": page_number,
+                # Include rule metadata for the report
+                "rule_code": item.rule_code,
+                "rule_text": item.title,
+                "severity": item.severity,
+                "source_document_id": item.source_document_id,
+                "source_document_title": item.source_document.title if item.source_document else None,
+                "source_section": item.source_section
             })
             
         return findings

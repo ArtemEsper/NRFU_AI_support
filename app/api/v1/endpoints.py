@@ -7,7 +7,7 @@ from app.models.models import SubmittedFile, Report, Call, ChecklistItem, Report
 from app.services.storage import storage_service
 from app.services.pdf_parsing import pdf_parsing_service
 from app.services.checklist import checklist_service
-from app.schemas.schemas import ApplicationPackageCreate, ApplicationPackageSchema, CallDocumentSchema, CallSchema
+from app.schemas.schemas import ApplicationPackageCreate, ApplicationPackageSchema, CallDocumentSchema, CallSchema, ChecklistItemSchema, ChecklistItemBase
 import hashlib
 import io
 
@@ -257,6 +257,34 @@ async def upload_call_document(
     db.commit()
     db.refresh(db_doc)
     return db_doc
+
+@router.get("/calls/{call_id}/rules", response_model=List[ChecklistItemSchema])
+async def list_call_rules(call_id: int, db: Session = Depends(get_db)):
+    # Check if call exists
+    call = db.query(Call).filter(Call.id == call_id).first()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    
+    # List active rules
+    rules = db.query(ChecklistItem).filter(ChecklistItem.call_id == call_id, ChecklistItem.is_active == True).all()
+    return rules
+
+@router.post("/calls/{call_id}/rules", response_model=ChecklistItemSchema)
+async def create_call_rule(call_id: int, rule_in: ChecklistItemBase, db: Session = Depends(get_db)):
+    # Check if call exists
+    call = db.query(Call).filter(Call.id == call_id).first()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    
+    # Create rule
+    db_rule = ChecklistItem(
+        call_id=call_id,
+        **rule_in.model_dump()
+    )
+    db.add(db_rule)
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
 
 @router.get("/calls/{call_id}/documents", response_model=List[CallDocumentSchema])
 async def list_call_documents(call_id: int, db: Session = Depends(get_db)):

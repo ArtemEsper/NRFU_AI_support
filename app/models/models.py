@@ -102,10 +102,19 @@ class ChecklistItem(Base):
     title = Column(String, nullable=False)
     description = Column(Text)
     rule_code = Column(String, index=True)  # Internal code for the rule
+    
+    # New fields for call-specific rule definitions
+    severity = Column(String, default="critical")  # critical, major, minor
+    source_document_id = Column(Integer, ForeignKey("call_documents.id"), nullable=True)
+    source_section = Column(String, nullable=True)  # e.g., "Section 3.1"
+    is_active = Column(Boolean, default=True)
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     call = relationship("Call", back_populates="items")
     findings = relationship("ReportFinding", back_populates="checklist_item")
+    source_document = relationship("CallDocument")
 
 class Report(Base):
     __tablename__ = "reports"

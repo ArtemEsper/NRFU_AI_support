@@ -100,11 +100,17 @@ class ChecklistItemBase(BaseModel):
     title: str
     description: Optional[str] = None
     rule_code: str
+    severity: Optional[str] = "critical"
+    source_document_id: Optional[int] = None
+    source_section: Optional[str] = None
+    is_active: bool = True
 
 class ChecklistItemSchema(ChecklistItemBase):
     id: int
     call_id: int
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    source_document: Optional[CallDocumentSchema] = None
 
     class Config:
         from_attributes = True
