@@ -1,4 +1,4 @@
-# NRFU AI Formal Criteria Checking MVP
+# AI-Assisted Grant Application Validation System (NRFU)
 
 This is an MVP for the National Research Foundation of Ukraine (NRFU) to support formal criteria checking of project application packages. It implements a package-centric submission model where each application consists of merged Ukrainian and (optionally) English PDFs.
 
@@ -30,6 +30,76 @@ This is an MVP for the National Research Foundation of Ukraine (NRFU) to support
     - `source_passage`: A 300-character snippet from the official `CallDocument` around the specified section.
     - `package_evidence`: Deterministic proof from the application package (e.g., matching file ID, detected registration number, or section count).
   - **Overall Status**: Calculates a final status (`pass`, `fail`, `review`) based on rule outcomes.
+
+## System Architecture
+
+```text
+Users / Operators
+(applicants, NRFU staff, scientific board members, reviewers)
+                         |
+                         v
++--------------------------------------------------------------+
+|                        FastAPI API Layer                     |
+|--------------------------------------------------------------|
+|  /calls   /calls/{id}/documents   /calls/{id}/rules         |
+|  /packages   /packages/{id}/upload   /reports/generate      |
++--------------------------------------------------------------+
+                         |
+                         v
++--------------------------------------------------------------+
+|                    Application Service Layer                 |
+|--------------------------------------------------------------|
+|  Call Management                                             |
+|  Application Package Management                             |
+|  Call Document Management                                   |
+|  Report Generation                                           |
+|  Rule / Checklist Management                                |
++--------------------------------------------------------------+
+              |                          |                     |
+              v                          v                     v
++---------------------------+  +------------------------+  +----------------------+
+|   PDF Parsing Service     |  | Deterministic Rule     |  | Source Passage /     |
+|---------------------------|  | Evaluation Engine      |  | Evidence Assembly    |
+| - full text extraction    |  |------------------------|  |----------------------|
+| - page count              |  | - file presence checks |  | - source snippets    |
+| - checksum                |  | - parseability checks  |  | - package evidence   |
+| - metadata extraction     |  | - section checks       |  | - grounded findings  |
+| - reg. number detection   |  | - bilingual checks     |  |                      |
+| - title detection         |  | - call-specific rules  |  |                      |
++---------------------------+  +------------------------+  +----------------------+
+              |                          |                     |
+              +--------------------------+---------------------+
+                                         |
+                                         v
++--------------------------------------------------------------+
+|                     Persistence / Storage Layer              |
+|--------------------------------------------------------------|
+| PostgreSQL                                                   |
+| - Calls                                                      |
+| - CallDocuments                                              |
+| - ChecklistItems / Call Rules                                |
+| - ApplicationPackages                                        |
+| - SubmittedFiles                                             |
+| - Reports / ReportFindings                                   |
+|                                                              |
+| Local File Storage (uploads/)                                |
+| - merged Ukrainian PDFs                                      |
+| - merged English PDFs                                        |
+| - call regulations / manuals / templates                     |
++--------------------------------------------------------------+
+                                         |
+                                         v
++--------------------------------------------------------------+
+|                    Future Extension Layer                    |
+|--------------------------------------------------------------|
+| - Reviewer workflow (approve / override / comments)          |
+| - Full-text search over call documents                       |
+| - Vector DB (pgvector or Qdrant)                             |
+| - RAG / LLM-based explanation and support                    |
+| - Background workers for heavy parsing                       |
+| - Azure Stack VM deployment                                  |
++--------------------------------------------------------------+
+```
 
 ## Getting Started
 
