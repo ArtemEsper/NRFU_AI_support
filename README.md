@@ -297,11 +297,20 @@ ENVIRONMENT=test pytest tests/test_checklist.py
 
 ## Roadmap
 
-- [x] Basic API for grant calls
-- [x] Metadata schema
-- [ ] Document ingestion pipeline
-- [ ] AI document classification
-- [ ] Automated reviewer assignment
+- [x] Grant call API and metadata model
+- [x] Package-centric submission model
+- [x] PDF ingestion, parsing, and metadata extraction
+- [x] Call document management
+- [x] Call-specific rule definitions
+- [x] Deterministic formal checks
+- [x] Grounded report generation
+- [ ] Improve rule grounding and source passage quality
+- [ ] Improve NRFU-specific title/section extraction
+- [ ] Build reviewer workflow and override logic
+- [ ] Add full-text search over call documents
+- [ ] Add vector search and RAG over authoritative documents
+- [ ] Add LLM-based support for staff and applicants
+- [ ] Prepare Azure Stack production deployment
 
 ## Project Structure
 - `app/api/v1`: Route handlers for packages, uploads, reports, and calls.
