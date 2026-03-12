@@ -1,5 +1,5 @@
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Optional, Any
+from pydantic import BaseModel, model_validator
 from datetime import datetime
 
 class SubmittedFileBase(BaseModel):
@@ -28,7 +28,7 @@ class SubmittedFileSchema(SubmittedFileBase):
         from_attributes = True
 
 class CallBase(BaseModel):
-    title: str
+    title: Optional[str] = None
     title_uk: Optional[str] = None
     title_en: Optional[str] = None
     code: str
@@ -42,7 +42,30 @@ class CallBase(BaseModel):
     status: Optional[str] = "draft"
 
 class CallCreate(CallBase):
-    pass
+    @model_validator(mode='before')
+    @classmethod
+    def validate_titles(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            title = data.get("title")
+            title_uk = data.get("title_uk")
+            title_en = data.get("title_en")
+            
+            # If only legacy 'title' is provided, map it to 'title_en' 
+            # and 'title_uk' if they are missing.
+            if title and not title_uk:
+                data["title_uk"] = title
+            if title and not title_en:
+                data["title_en"] = title
+                
+            # Ensure at least one of title_uk or title_en is present
+            if not data.get("title_uk") and not data.get("title_en"):
+                raise ValueError("At least one of 'title_uk' or 'title_en' must be provided.")
+            
+            # For the database 'title' field (legacy), ensure it is populated
+            if not data.get("title"):
+                data["title"] = data.get("title_uk") or data.get("title_en")
+                
+        return data
 
 class CallDocumentBase(BaseModel):
     document_type: str

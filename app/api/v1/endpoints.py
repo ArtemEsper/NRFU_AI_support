@@ -213,6 +213,11 @@ async def generate_report(package_id: int, db: Session = Depends(get_db)):
         "findings": findings_data
     }
 
+@router.get("/calls", response_model=List[CallSchema])
+async def list_calls(db: Session = Depends(get_db)):
+    calls = db.query(Call).all()
+    return calls
+
 @router.get("/calls/{call_id}", response_model=CallSchema)
 async def get_call(call_id: int, db: Session = Depends(get_db)):
     call = db.query(Call).filter(Call.id == call_id).first()

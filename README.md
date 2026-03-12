@@ -77,8 +77,8 @@ If you need to create a specific call manually before creating a package, follow
 curl -X POST "http://localhost:8000/api/v1/calls" \
      -H "Content-Type: application/json" \
      -d '{
-       "title": "Excellence Science in Ukraine",
        "title_uk": "Передова наука в Україні",
+       "title_en": "Excellence Science in Ukraine",
        "code": "2023.03",
        "requires_english_mirror": true,
        "status": "active"
@@ -114,6 +114,12 @@ curl -X POST "http://localhost:8000/api/v1/calls/3/rules" \
 ---
 
 ## Example API Workflow
+
+### 0. List Existing Calls
+To see all currently available Funding Calls:
+```bash
+curl -X GET "http://localhost:8000/api/v1/calls"
+```
 
 ### 1. Create a Submission Package
 Create a package linked to the `call_id` you seeded above.
@@ -218,6 +224,14 @@ ENVIRONMENT=test pytest tests/test_main.py
 ENVIRONMENT=test pytest tests/test_pdf.py
 ENVIRONMENT=test pytest tests/test_checklist.py
 ```
+
+## Roadmap
+
+- [x] Basic API for grant calls
+- [x] Metadata schema
+- [ ] Document ingestion pipeline
+- [ ] AI document classification
+- [ ] Automated reviewer assignment
 
 ## Project Structure
 - `app/api/v1`: Route handlers for packages, uploads, reports, and calls.
