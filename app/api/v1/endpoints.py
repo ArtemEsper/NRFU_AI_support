@@ -113,6 +113,7 @@ async def upload_document(
         detected_project_title=parsing_results["detected_project_title"],
         detected_language_note=parsing_results["detected_language_note"],
         status="completed",
+        parsing_result=parsing_results["parsing_result"],
         metadata_json={
             "pdf_metadata": parsing_results["metadata"],
             "preview": parsing_results["preview"]
@@ -277,7 +278,8 @@ async def upload_call_document(
         stored_path=file_path,
         checksum=checksum,
         extracted_text=parsing_results["full_text"],
-        extracted_text_length=parsing_results["extracted_text_length"]
+        extracted_text_length=parsing_results["extracted_text_length"],
+        parsing_result=parsing_results["parsing_result"]
     )
     db.add(db_doc)
     db.commit()

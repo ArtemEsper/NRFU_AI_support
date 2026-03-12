@@ -23,6 +23,7 @@ class SubmittedFile(Base):
     detected_language_note = Column(String)
     status = Column(String, default="pending")  # pending, processing, completed, error
     metadata_json = Column(JSON, default={})
+    parsing_result = Column(JSON, default={})  # Structured results: sections, page_map, markers
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -72,6 +73,7 @@ class CallDocument(Base):
     checksum = Column(String)
     extracted_text = Column(Text)
     extracted_text_length = Column(Integer)
+    parsing_result = Column(JSON, default={})  # Structured results: sections, clause blocks
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

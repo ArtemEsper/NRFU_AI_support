@@ -7,11 +7,40 @@ class ChecklistService:
     def _extract_source_passage(self, document: CallDocument, section_keyword: str) -> str:
         """
         Extract a short snippet around the section keyword from the source document.
+        Now uses structured parsing_result if available to find section content.
         """
         if not document or not document.extracted_text or not section_keyword:
             return None
         
         text = document.extracted_text
+        parsing_result = document.parsing_result or {}
+        sections = parsing_result.get("sections", [])
+        
+        # Try to find the section in structured data first
+        if sections:
+            for i, section in enumerate(sections):
+                if section_keyword.lower() in section["title"].lower():
+                    # Found the heading. Extract text from this heading to the next one (or a window)
+                    start_page = section.get("page", 1)
+                    # We don't have exact character offsets for sections yet, 
+                    # so we fall back to finding the title in the full text
+                    index = text.find(section["title"])
+                    if index != -1:
+                        # Find the start of the next section if possible
+                        next_index = len(text)
+                        if i + 1 < len(sections):
+                            next_index = text.find(sections[i+1]["title"], index + len(section["title"]))
+                            if next_index == -1:
+                                next_index = index + 1000 # fallback window
+                        
+                        # Limit the window size for the snippet
+                        end = min(index + 1000, next_index)
+                        snippet = text[index:end].replace("\n", " ").strip()
+                        if len(snippet) > 500:
+                            snippet = snippet[:497] + "..."
+                        return f"[Source: {section['title']}] {snippet}"
+
+        # Fallback to simple keyword matching if structured search fails
         index = text.lower().find(section_keyword.lower())
         
         if index == -1:
