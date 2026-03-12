@@ -1,3 +1,41 @@
+# Engineering Overview
+
+AI-assisted backend system designed to support formal verification of research grant applications submitted to the National Research Foundation of Ukraine (NRFU).
+
+The system processes application packages consisting of merged Ukrainian and optional English PDFs. It extracts metadata and full document text, and evaluates the submission against formal criteria defined in the funding call regulations.
+
+Evaluation results are returned as structured reports containing grounded evidence from both the submitted application and the authoritative call documentation.
+
+The architecture prioritizes deterministic rule-based checks, while being designed for future AI-assisted evaluation and retrieval-augmented reasoning (RAG).
+
+### Key Capabilities
+
+- package-centric submission model for research applications
+- document ingestion and validation pipeline for merged PDFs
+- full-text extraction and heuristic metadata detection
+- rule-based formal compliance engine linked to funding calls
+- grounded reporting referencing official call regulations
+- architecture prepared for future RAG / LLM-based evaluation
+
+### Core Technologies
+
+Python • FastAPI • PostgreSQL • Docker • PyMuPDF • SQLAlchemy • Alembic
+
+### Design Principles
+
+- **Deterministic first** — formal checks are implemented as explicit rules
+- **Grounded evaluation** — findings reference authoritative regulatory documents
+- **Traceable decisions** — reports contain evidence from both regulations and application files
+- **Extensible architecture** — designed to support vector search, RAG, and AI assistants
+
+### Future Extensions
+
+- vector search over regulatory documents (pgvector / Qdrant)
+- RAG-based explanation of formal requirements
+- AI-assisted reviewer support tools
+- automated reviewer workflows
+- integration with NRFU submission platforms
+
 # AI-Assisted Grant Application Validation System (NRFU)
 
 This is an MVP for the National Research Foundation of Ukraine (NRFU) to support formal criteria checking of project application packages. It implements a package-centric submission model where each application consists of merged Ukrainian and (optionally) English PDFs.
