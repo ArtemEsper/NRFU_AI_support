@@ -1,8 +1,14 @@
 import fitz  # PyMuPDF
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import re
+import os
+import tempfile
+from app.services.layout_enrichment import LayoutEnrichmentService
 
 class PdfParsingService:
+    def __init__(self):
+        self.enrichment_service = LayoutEnrichmentService()
+
     async def parse_pdf(self, file_content: bytes) -> Dict[str, Any]:
         """
         Extract text, page count, and metadata from PDF using PyMuPDF.
@@ -42,6 +48,29 @@ class PdfParsingService:
         # Detect markers
         markers = self._detect_markers(full_text, pages_text)
         
+        # Optional LiteParse enrichment
+        enrichment_result = None
+        if self.enrichment_service.enabled:
+            pages_to_enrich = []
+            for i, page_text in enumerate(pages_text):
+                # Check if this page needs enrichment
+                # We can also pass some context if we have it
+                context = {"section_type": None} # Could be improved with actual section info
+                if self.enrichment_service.should_apply_layout_enrichment(page_text, i, context):
+                    pages_to_enrich.append(i)
+            
+            if pages_to_enrich:
+                # We need a file path for LiteParse
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(file_content)
+                    tmp_path = tmp.name
+                
+                try:
+                    enrichment_result = self.enrichment_service.enrich_document(tmp_path, page_indices=pages_to_enrich)
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+        
         doc.close()
         
         parsing_result = {
@@ -54,6 +83,9 @@ class PdfParsingService:
                 "project_title": project_title
             }
         }
+
+        if enrichment_result:
+            parsing_result["enrichment"] = enrichment_result.model_dump()
         
         return {
             "page_count": page_count,

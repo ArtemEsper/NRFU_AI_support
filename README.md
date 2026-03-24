@@ -20,6 +20,7 @@ AI-assisted backend system designed to support formal verification of research g
 - **Package-Centric Submission**: Group multiple files (UK/EN) under a single `ApplicationPackage`.
 - **Authoritative Document Management**: Support for uploading and storing official call regulations and templates as the "Source of Truth".
 - **Enhanced PDF Ingestion**: Full-text extraction and heuristic metadata detection (registration numbers, titles) using PyMuPDF.
+- **Layout Enrichment Layer**: Optional LiteParse integration for handling complex layouts, tables, and OCR-needed pages.
 - **Deterministic Rule Engine**: Call-specific rules (mandatory files, bilingual consistency, section detection) with grounded evaluation.
 - **Grounded Reporting**: Structured JSON reports with references to regulatory sources, source passages, and package-side evidence.
 
@@ -106,6 +107,7 @@ Users / Operators
 1️⃣ **Application Submission**: Applicants or operators create an `ApplicationPackage` linked to a specific funding call. Merged application PDFs (Ukrainian mandatory, English optional) are uploaded via `POST /api/v1/packages/{package_id}/upload`.
 
 2️⃣ **PDF Ingestion and Parsing**: The system validates PDF structure, generates checksums (SHA256), detects page counts, and performs full-text and heuristic metadata extraction using **PyMuPDF**.
+**Layout Enrichment (Optional)**: If enabled, **LiteParse** provides a secondary enrichment layer for difficult pages (tables, scans, complex layouts) using layout-aware extraction and OCR.
 
 3️⃣ **Rule Evaluation**: The `ChecklistService` evaluates the package against deterministic call-specific rules (presence, parseability, bilingual consistency, section detection).
 
@@ -116,7 +118,7 @@ Users / Operators
 ## Technologies Used
 
 - **Backend**: Python, FastAPI
-- **Data Processing**: PyMuPDF (PDF parsing), Heuristic metadata extraction
+- **Data Processing**: PyMuPDF (PDF parsing), LiteParse (Layout Enrichment), Heuristic metadata extraction
 - **Data Storage**: PostgreSQL, SQLAlchemy ORM, Alembic (migrations)
 - **Infrastructure**: Docker, Docker Compose
 - **Testing**: pytest
@@ -194,6 +196,24 @@ curl -X POST "http://localhost:8000/api/v1/reports/generate?package_id=1"
 2. **Interactive Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 3. **Database Migrations**: `docker compose exec app alembic upgrade head`
 
+### Optional: Layout Enrichment (LiteParse)
+To enable LiteParse enrichment for complex documents:
+1. **Install LiteParse and Tesseract**:
+   ```bash
+   pip install liteparse
+   # System dependency for OCR
+   apt-get install tesseract-ocr
+   ```
+2. **Enable in `.env`**:
+   ```env
+   USE_LITEPARSE_ENRICHMENT=True
+   LITEPARSE_OCR_ENABLED=True
+   ```
+3. **Run Evaluation Script**:
+   ```bash
+   python scripts/evaluate_liteparse.py
+   ```
+
 ### Running Tests
 ```bash
 docker compose run --rm -e ENVIRONMENT=test app pytest
@@ -225,6 +245,7 @@ docker compose run --rm -e ENVIRONMENT=test app pytest
 - `app/models`: SQLAlchemy domain models (`Call`, `ApplicationPackage`, `SubmittedFile`, `CallDocument`).
 - `app/services`: 
   - `pdf_parsing.py`: Text extraction and heuristic metadata logic via PyMuPDF.
+  - `layout_enrichment.py`: LiteParse-based layout enrichment and OCR fallback.
   - `checklist.py`: Deterministic rule evaluation engine.
   - `storage.py`: Local file storage abstraction.
 - `migrations`: Alembic database versioning.

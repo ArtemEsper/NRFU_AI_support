@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     UPLOAD_DIR: str = "uploads"
+    SCREENSHOTS_DIR: str = "screenshots"
+
+    # LiteParse configuration
+    USE_LITEPARSE_ENRICHMENT: bool = False
+    LITEPARSE_OCR_ENABLED: bool = True
+    LITEPARSE_OCR_ENGINE: str = "tesseract"  # or "external"
+    LITEPARSE_SCREENSHOT_ENABLED: bool = True
+    LITEPARSE_MAX_PAGES: Optional[int] = None
 
     # noinspection PyTypeChecker
     model_config = SettingsConfigDict(
