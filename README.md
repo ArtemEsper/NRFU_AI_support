@@ -198,20 +198,30 @@ curl -X POST "http://localhost:8000/api/v1/reports/generate?package_id=1"
 
 ### Optional: Layout Enrichment (LiteParse)
 To enable LiteParse enrichment for complex documents:
-1. **Install LiteParse and Tesseract**:
-   ```bash
-   pip install liteparse
-   # System dependency for OCR
-   apt-get install tesseract-ocr
-   ```
-2. **Enable in `.env`**:
+1. **Install LiteParse**:
+   - For library integration (Python):
+     ```bash
+     pip install liteparse
+     ```
+   - For CLI integration (Node.js/npm) - **Recommended**:
+     ```bash
+     npm i -g @llamaindex/liteparse
+     ```
+2. **Install System Dependencies**:
+   - Tesseract OCR (if enabled): `apt-get install tesseract-ocr`
+   - LibreOffice (for office format support)
+   - ImageMagick (for advanced image processing)
+3. **Enable in `.env`**:
    ```env
    USE_LITEPARSE_ENRICHMENT=True
+   LITEPARSE_USE_CLI=True
+   LITEPARSE_CLI_PATH=lit
    LITEPARSE_OCR_ENABLED=True
    ```
-3. **Run Evaluation Script**:
+4. **Run Evaluation / Test Scripts**:
    ```bash
    python scripts/evaluate_liteparse.py
+   python scripts/test_liteparse_cli.py
    ```
 
 ### Running Tests
