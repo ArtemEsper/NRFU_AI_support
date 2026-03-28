@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
+import os
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "NRFU AI Formal Criteria Checking MVP"
@@ -19,7 +20,8 @@ class Settings(BaseSettings):
             return self.DATABASE_URL
         
         if self.ENVIRONMENT == "test":
-            return "sqlite:///./test.db"
+            # Use a unique name to avoid multi-process/session conflicts
+            return f"sqlite:///./test_{os.getpid()}.db"
             
         return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
 

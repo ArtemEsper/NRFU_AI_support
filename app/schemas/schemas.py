@@ -1,5 +1,5 @@
 from typing import List, Optional, Any
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, model_validator, ConfigDict
 from datetime import datetime
 
 class SubmittedFileBase(BaseModel):
@@ -24,8 +24,7 @@ class SubmittedFileSchema(SubmittedFileBase):
     metadata_json: Optional[dict] = None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class CallBase(BaseModel):
     title: Optional[str] = None
@@ -89,8 +88,7 @@ class CallDocumentSchema(CallDocumentBase):
     created_at: datetime
     updated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class CallSchema(CallBase):
     id: int
@@ -98,8 +96,7 @@ class CallSchema(CallBase):
     updated_at: Optional[datetime] = None
     documents: List[CallDocumentSchema] = []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ApplicationPackageBase(BaseModel):
     call_id: int
@@ -116,8 +113,7 @@ class ApplicationPackageSchema(ApplicationPackageBase):
     updated_at: Optional[datetime] = None
     files: List[SubmittedFileSchema] = []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ChecklistItemBase(BaseModel):
     title: str
@@ -147,8 +143,7 @@ class ChecklistItemSchema(ChecklistItemBase):
     updated_at: Optional[datetime] = None
     source_document: Optional[CallDocumentSchema] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ReportBase(BaseModel):
     package_id: int
@@ -169,8 +164,7 @@ class ReportFindingSchema(BaseModel):
     page_number: Optional[int] = None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ReportSchema(ReportBase):
     id: int
@@ -178,5 +172,47 @@ class ReportSchema(ReportBase):
     created_at: datetime
     findings: List[ReportFindingSchema] = []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+class DocumentBlock(BaseModel):
+    block_type: str  # metadata, narrative, table, profile, scan, marker
+    text: str
+    page_number: int
+    metadata: Optional[dict] = None
+
+class DocumentSection(BaseModel):
+    title: str
+    anchor: str
+    page_number: int
+    text_preview: Optional[str] = None
+    char_start: Optional[int] = None
+    char_end: Optional[int] = None
+    blocks: List[DocumentBlock] = []
+    subsections: List['DocumentSection'] = []
+
+class PageClassification(BaseModel):
+    page_number: int
+    type: str  # content, marker_only, marker_plus_content
+    anchors: List[str] = []
+
+class DocumentZone(BaseModel):
+    name: str
+    zone_type: str
+    page_start: int
+    page_end: Optional[int] = None
+    sections: List[DocumentSection] = []
+    blocks: List[DocumentBlock] = []
+    text_preview: Optional[str] = None
+    trigger_reason: Optional[str] = None
+
+class ParsedDocumentStructure(BaseModel):
+    application_id: Optional[str] = None
+    project_title: Optional[str] = None
+    call_title: Optional[str] = None
+    pi_name: Optional[str] = None
+    zones: List[DocumentZone] = []
+    detected_anchors: List[dict] = [] # list of {text, page, match}
+    page_classifications: List[PageClassification] = []
+    metadata: Optional[dict] = None
+    pages: List[str] = []
+    debug_log: List[str] = []
