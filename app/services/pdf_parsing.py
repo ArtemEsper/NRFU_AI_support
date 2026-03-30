@@ -1,5 +1,5 @@
 import fitz  # PyMuPDF
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set, Tuple
 import re
 import os
 import tempfile
@@ -8,6 +8,105 @@ import logging
 from app.core.logger import logger
 from app.services.layout_enrichment import LayoutEnrichmentService
 from app.schemas.schemas import DocumentZone, DocumentSection, ParsedDocumentStructure, PageClassification, DocumentBlock
+
+class SemanticValidator:
+    """Helper class for semantic validation of extracted fields."""
+    
+    @staticmethod
+    def is_orcid(text: Optional[str]) -> bool:
+        if not text: return False
+        # ORCID pattern: https://orcid.org/0000-0002-1825-0097 or 0000-0002-1825-0097
+        pattern = r"(\d{4}-\d{4}-\d{4}-\d{3}[\dX])"
+        return bool(re.search(pattern, text))
+
+    @staticmethod
+    def normalize_orcid(text: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        if not text: return None, None
+        pattern = r"(\d{4}-\d{4}-\d{4}-\d{3}[\dX])"
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1), text.strip()
+        return None, text.strip()
+
+    @staticmethod
+    def is_email(text: Optional[str]) -> bool:
+        if not text: return False
+        pattern = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+        return bool(re.search(pattern, text))
+
+    @staticmethod
+    def is_phone(text: Optional[str]) -> bool:
+        if not text: return False
+        # Ukrainian phone numbers usually +380... or similar
+        pattern = r"(\+?\d{2}\s?\(?\d{3}\)?\s?\d{3}[\s-]?\d{2}[\s-]?\d{2})"
+        # Or more generic but numeric-heavy
+        if len(re.findall(r"\d", text)) < 7: return False
+        return bool(re.search(pattern, text)) or bool(re.search(r"[\+\d\s\-\(\)]{7,}", text))
+
+    @staticmethod
+    def is_citizenship(text: Optional[str]) -> bool:
+        if not text: return False
+        # Should look like a country or nationality
+        nationalities = ["Україна", "України", "Українець", "Українка", "Ukraine", "Ukrainian"]
+        if any(nat.lower() in text.lower() for nat in nationalities):
+            return True
+        # If it's short and contains only letters, it might be a country
+        if len(text) < 30 and text.isalpha():
+            return True
+        return False
+
+    @staticmethod
+    def is_address(text: Optional[str], labels: List[str]) -> bool:
+        if not text: return False
+        # Should not be equal to any of the field labels
+        for label in labels:
+            if label.lower() == text.lower().strip():
+                return False
+        # Addresses usually contain numbers, streets, cities
+        # Simple heuristic: at least some letters and maybe a number
+        return len(text.strip()) > 5
+
+    @staticmethod
+    def clean_name_and_get_titles(name: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Remove titles and honorifics from name and return them separately."""
+        # Order matters: longer strings first to avoid partial matches
+        titles = [r"Доктор\s+наук", r"Професор", r"Доктор", r"Пан", r"Пані", r"К\.т\.н\.", r"Д\.т\.н\.", r"Ph\.D\.", r"PhD", r"Professor", r"Dr\."]
+        cleaned = name
+        detected_titles = []
+        
+        # Apply cleaning iteratively to handle multiple titles
+        changed = True
+        while changed:
+            original = cleaned
+            for title in titles:
+                match = re.search(r"^\s*(" + title + r")\b\s*", cleaned, flags=re.IGNORECASE)
+                if match:
+                    detected_titles.append(match.group(1).strip())
+                    cleaned = re.sub(r"^\s*" + title + r"\b\s*", "", cleaned, flags=re.IGNORECASE).strip()
+            changed = (original != cleaned)
+            
+        degree = None
+        # Heuristic for degree: often contains "наук" or "к.т.н." etc.
+        for t in detected_titles:
+            if any(kw in t.lower() for kw in ["наук", "к.", "д.", "ph"]):
+                degree = t
+                break
+        
+        title = None
+        for t in detected_titles:
+            if t != degree:
+                title = t
+                break
+                
+        # Additional cleanup for name (ensure it doesn't contain institution text)
+        # Names are usually 2-3 words. If it's much longer, it might be noisy.
+        # But for now we just return the cleaned name.
+        return cleaned.strip(), title, degree
+
+    @staticmethod
+    def clean_name(name: str) -> str:
+        cleaned, _, _ = SemanticValidator.clean_name_and_get_titles(name)
+        return cleaned
 
 class PdfParsingService:
     def __init__(self):
@@ -67,6 +166,7 @@ class PdfParsingService:
 
         parsing_result = {
             "structure": normalized_structure,
+            # Legacy compatibility projection. Canonical consumer path is parsing_result["structure"].
             "sections": [s.model_dump() for zone in structure.zones for s in zone.sections],
             "page_map": page_map,
             "markers": markers,
@@ -112,8 +212,8 @@ class PdfParsingService:
             full_result["full_pages_text"] = pages_text
             self._save_debug_json(full_result, filename="debug_parse_output.json")
             
-            # Save normalized structure without raw page text and with cleaned structure
-            self._save_debug_json(parsing_result, filename="normalized_structure.json")
+            # Save normalized structure directly
+            self._save_debug_json(normalized_structure, filename="normalized_structure.json")
 
         return {
             "page_count": page_count,
@@ -469,6 +569,22 @@ class PdfParsingService:
                         seen_in_zone.add(block_key)
 
                         b_type = "paragraph"
+                        
+                        # Task 1: Remove anchor text from all block content
+                        is_exact_anchor = False
+                        for a_def in anchor_defs:
+                            for pattern in a_def["patterns"]:
+                                if re.search(pattern, line, re.IGNORECASE):
+                                    is_exact_anchor = True
+                                    break
+                            if is_exact_anchor: break
+                        
+                        if is_exact_anchor:
+                            # Skip adding this line as a block content if it's exactly the anchor
+                            # (unless it's a marker page, where we keep marker_block)
+                            if p_num not in marker_pages:
+                                continue
+
                         # Detect headers
                         is_header = False
                         if z.zone_type == "description":
@@ -479,9 +595,17 @@ class PdfParsingService:
                                     if re.search(pattern, line, re.IGNORECASE):
                                         is_header = True
                                         break
-                        
+                                        
+                        # Task 2: Detect subsection headers
+                        is_sub_header = False
+                        if z.zone_type == "description" and not is_header:
+                            if self._is_subsection_header(line):
+                                is_sub_header = True
+
                         if is_header:
                             b_type = "section_header"
+                        elif is_sub_header:
+                            b_type = "subsection_header"
                         elif z.zone_type in ["pi_profile", "team"]:
                             b_type = "profile_block"
                         elif z.zone_type == "institution":
@@ -492,6 +616,11 @@ class PdfParsingService:
                             b_type = "scan_block"
                         elif p_num in marker_pages:
                             b_type = "marker_block"
+                        
+                        # Precision Refinement: Detect foreign structured blocks in narrative zones
+                        if z.zone_type == "description" and b_type == "paragraph":
+                            if self._is_foreign_structured_content(line):
+                                b_type = "foreign_structured_block"
                             
                         zone_blocks.append(DocumentBlock(
                             block_type=b_type,
@@ -506,8 +635,11 @@ class PdfParsingService:
             if z.blocks:
                 current_block = None
                 for b in z.blocks:
+                    # Skip merging for special blocks (including headers)
                     if b.block_type != "paragraph":
                         if current_block:
+                            # Task 4: Cleanup merged block (remove trailing hyphen or whitespace)
+                            current_block.text = current_block.text.strip()
                             reconstructed_blocks.append(current_block)
                             current_block = None
                         reconstructed_blocks.append(b)
@@ -516,7 +648,7 @@ class PdfParsingService:
                     if current_block is None:
                         current_block = DocumentBlock(
                             block_type="paragraph",
-                            text=b.text,
+                            text=b.text.strip(),
                             page_number=b.page_number
                         )
                     else:
@@ -525,51 +657,49 @@ class PdfParsingService:
                         curr_text = b.text.strip()
                         
                         should_merge = False
+                        is_narrative_zone = z.zone_type == "description"
                         if prev_text:
                             # 1. Merge if previous line does NOT end with sentence-ending punctuation
-                            # and next line starts with lowercase or continuation
                             last_char = prev_text[-1]
                             ends_sentence = last_char in [".", "!", "?", ":", ";"]
                             
                             starts_with_lower = curr_text and curr_text[0].islower()
-                            # Common Ukrainian/Russian continuation characters or specific NRFU markers
                             is_continuation = curr_text and curr_text[0] in ["(", ")", ",", "-", "–", "—"]
-                            
-                            # Bullet point detection - bullets should start a NEW paragraph
                             is_bullet = curr_text and (curr_text.startswith("•") or curr_text.startswith("-") or curr_text.startswith("*"))
                             
-                            # 3. Paragraph merging (target 3-10 lines)
-                            # We only merge if it's not a bullet and not already too long
-                            if not is_bullet and (not ends_sentence or starts_with_lower or is_continuation):
-                                # Heuristic: limit block length to avoid massive blocks
-                                if len(prev_text) < 2000:
-                                    should_merge = True
+                            # Task 4: Merge line-by-line fragments (fragments shorter than ~30 chars)
+                            is_short_fragment = len(prev_text) < 40 or len(curr_text) < 40
+                            
+                            # Aggressive merge is limited to narrative zones.
+                            # Metadata-heavy zones (e.g. Zone 1) keep line boundaries for label/value parsing.
+                            if is_narrative_zone and not is_bullet:
+                                if not ends_sentence or starts_with_lower or is_continuation or is_short_fragment:
+                                    if len(prev_text) < 3000: # Slightly larger max length
+                                        should_merge = True
                                 
-                        # 2. Merge broken words (e.g. бар’ + єрного)
-                        # Detect if prev ends with ' or - and merge without space
+                        # 2. Merge broken words
                         if prev_text and (prev_text.endswith("’") or prev_text.endswith("'") or prev_text.endswith("-")):
-                             # For hyphen, we might want to keep it or remove it depending on if it's a real hyphenated word.
-                             # But requirements say "join into one token".
-                             # Usually trailing hyphen at EOL is a split word.
                              join_char = ""
                              if prev_text.endswith("-"):
-                                 # Basic heuristic: if it's a long word split, remove hyphen. 
-                                 # If it's a small word, it might be a real hyphen.
-                                 # Spec says "join into one token".
-                                 prev_text = prev_text[:-1]
+                                 # Heuristic: if it's a long word split, remove hyphen.
+                                 # We check if the last char before hyphen is a letter and first char of next is a letter.
+                                 if len(prev_text) > 1 and prev_text[-2].isalpha() and curr_text and curr_text[0].isalpha():
+                                     prev_text = prev_text[:-1]
                              
                              current_block.text = prev_text + join_char + curr_text
                         elif should_merge:
                             current_block.text = prev_text + " " + curr_text
                         else:
+                            current_block.text = prev_text.strip()
                             reconstructed_blocks.append(current_block)
                             current_block = DocumentBlock(
                                 block_type="paragraph",
-                                text=b.text,
+                                text=b.text.strip(),
                                 page_number=b.page_number
                             )
                 
                 if current_block:
+                    current_block.text = current_block.text.strip()
                     reconstructed_blocks.append(current_block)
             
             z.blocks = reconstructed_blocks
@@ -585,6 +715,19 @@ class PdfParsingService:
                 
                 current_sub = None
                 for block in z.blocks:
+                    # Group foreign_structured_blocks into a synthetic section
+                    if block.block_type == "foreign_structured_block":
+                        if not current_sub or current_sub.title != "Foreign Structured Forms":
+                            current_sub = DocumentSection(
+                                title="Foreign Structured Forms",
+                                anchor="Synthetic",
+                                page_number=block.page_number,
+                                subsections=[]
+                            )
+                            main_section.subsections.append(current_sub)
+                        current_sub.blocks.append(block)
+                        continue
+
                     if block.block_type == "section_header":
                         # Check if it's a subsection or the main title
                         is_main = re.search(r"^\s*Опис\s+проєкту\s*$", block.text, re.IGNORECASE)
@@ -613,6 +756,15 @@ class PdfParsingService:
                                 current_sub.blocks.append(block)
                             else:
                                 main_section.blocks.append(block)
+                    elif block.block_type == "subsection_header":
+                        # Task 3: Attach narrative to header
+                        # Treat subsection_header as a marker that starts a group of narrative blocks
+                        # We don't necessarily create a DocumentSection for it if it's not a 3.x subsection,
+                        # but we ensure it's in the blocks list before narrative.
+                        if current_sub:
+                            current_sub.blocks.append(block)
+                        else:
+                            main_section.blocks.append(block)
                     else:
                         # Narrative block
                         if current_sub:
@@ -683,7 +835,31 @@ class PdfParsingService:
         structure.application_id = self._extract_registration_number(p1_text)
         structure.call_title = self._extract_call_title(p1_text)
         
+        # Deterministic Zone 1 metadata extraction from the actual Zone 1 blocks.
+        zone1 = next((z for z in structure.zones if z.zone_type == "header"), None)
+        z1_meta = self._extract_zone1_metadata(zone1, pages_text)
+
+        if not structure.metadata: structure.metadata = {}
+        structure.metadata.update(z1_meta)
+        
+        # Application ID might be found here too
+        if z1_meta.get("application_id") and not structure.application_id:
+            structure.application_id = z1_meta["application_id"]
+
         structure.debug_log = debug_log
+        if zone1 and z1_meta:
+            # Ensure Zone 1 has a structured metadata representation in its own block path.
+            zone1_meta_block = next((b for b in zone1.blocks if b.block_type == "metadata_block"), None)
+            if zone1_meta_block:
+                zone1_meta_block.metadata = z1_meta
+            else:
+                zone1.blocks.insert(0, DocumentBlock(
+                    block_type="metadata_block",
+                    text="Zone 1 Metadata",
+                    page_number=zone1.page_start,
+                    metadata=z1_meta
+                ))
+
         return structure
 
     def _extract_institution_profile(self, zone: DocumentZone, pages: List[str], structure: ParsedDocumentStructure):
@@ -697,7 +873,7 @@ class PdfParsingService:
         regex_map = {
             "institution_name": r"(?:Назва\s+установи|Учасник\s+конкурсу(?:\/субвиконавці)?)\s*:?\s*(.+)",
             "edrpou_code": r"Код\s+ЄДРПОУ\s*:?\s*(\d{8})",
-            "kved_code": r"Код\(и\)\s+КВЕД\s*:?\s*([\d\.,\s]+)",
+            "kved_code": r"Код\(и\)\s+КВЕД\s*:?\s*([\d\.,\s]{5,})",
             "legal_address": r"Юридична\s+адреса\s*:?\s*(.+)",
             "postal_address": r"Поштова\s+адреса\s*:?\s*(.+)",
             "physical_address": r"Фактична\s+адреса\s*:?\s*(.+)",
@@ -706,10 +882,28 @@ class PdfParsingService:
             "website": r"Посилання\s+на\s+веб\s*сторінку\s*:?\s*(https?://[^\s]+|www\.[^\s]+)",
         }
 
+        labels_to_check = [
+            "Назва установи", "Код ЄДРПОУ", "Код(и) КВЕД", "Юридична адреса", 
+            "Поштова адреса", "Фактична адреса", "Телефон", "Адреса електронної пошти", 
+            "Посилання на веб сторінку", "підприємства/установи/організації"
+        ]
+
         for field, pattern in regex_map.items():
             match = re.search(pattern, full_zone_text, re.IGNORECASE | re.MULTILINE)
             if match:
-                inst_data[field] = match.group(1).strip()
+                val = match.group(1).strip()
+                # Semantic validation
+                is_valid = True
+                if field == "edrpou_code" and not re.match(r"^\d{8}$", val): is_valid = False
+                if field in ["legal_address", "physical_address", "postal_address"]:
+                    if not SemanticValidator.is_address(val, labels_to_check): is_valid = False
+                if field == "phone_number" and not SemanticValidator.is_phone(val): is_valid = False
+                if field == "email" and not SemanticValidator.is_email(val): is_valid = False
+                
+                if is_valid:
+                    inst_data[field] = val
+                else:
+                    inst_data[field] = None
 
         # Fallback for institution name if not matched by label
         if "institution_name" not in inst_data:
@@ -734,7 +928,12 @@ class PdfParsingService:
         """Extract structured fields from PI Profile (Zone 5)."""
         if not structure.metadata: structure.metadata = {}
         
-        pi_data = {"name": structure.pi_name}
+        pi_name, pi_title, pi_degree = SemanticValidator.clean_name_and_get_titles(structure.pi_name or "")
+        pi_data = {
+            "name": pi_name,
+            "title": pi_title,
+            "degree": pi_degree
+        }
         
         full_zone_text = ""
         for block in zone.blocks:
@@ -748,7 +947,7 @@ class PdfParsingService:
             "orcid": r"ORCID",
             "h_index_scopus": r"Індекс\s+Хірша\s+\(SCOPUS\)",
             "total_publications": r"Загальна\s+кількість\s+публікацій",
-            "degree": r"Науковий\s+ступінь",
+            "degree_raw": r"Науковий\s+ступінь",
             "position": r"Посада",
             "phone": r"(?:Мобільний\s+)?телефон",
             "email": r"Електронна\s+пошта"
@@ -757,29 +956,33 @@ class PdfParsingService:
         lines = [l.strip() for l in full_zone_text.split("\n") if l.strip()]
         for field, label_pat in labels.items():
             for i, line in enumerate(lines):
+                val = None
                 # Check for label match
                 if re.search(r"^" + label_pat + r"\s*:", line, re.IGNORECASE):
                     val = line.split(":", 1)[1].strip()
                     if not val and i + 1 < len(lines):
                         val = lines[i+1]
-                    
-                    # Sanity check: citizenship shouldn't be a phone number
-                    if field == "citizenship" and re.search(r"[\+\d\s\-\(\)]{7,}", val):
-                        continue # Skip incorrect mapping
-                    if field == "phone" and not re.search(r"[\+\d\s\-\(\)]{7,}", val):
-                        continue
-                        
-                    pi_data[field] = val
-                    break
                 elif re.search(r"^" + label_pat + r"$", line, re.IGNORECASE):
                      if i + 1 < len(lines):
                         val = lines[i+1]
-                        # Sanity checks
-                        if field == "citizenship" and re.search(r"[\+\d\s\-\(\)]{7,}", val):
-                            continue
+                
+                if val:
+                    # Normalization
+                    if field == "orcid":
+                        norm_orcid, raw_orcid = SemanticValidator.normalize_orcid(val)
+                        pi_data["orcid"] = norm_orcid
+                        pi_data["orcid_raw"] = raw_orcid
+                    elif field == "phone" and not SemanticValidator.is_phone(val):
+                        pi_data[field] = None
+                    elif field == "email" and not SemanticValidator.is_email(val):
+                        pi_data[field] = None
+                    else:
                         pi_data[field] = val
-                        break
+                    break
         
+        if not pi_data.get("degree") and pi_data.get("degree_raw"):
+            pi_data["degree"] = pi_data["degree_raw"]
+
         structure.metadata["pi_profile"] = pi_data
 
         # Update ONLY the first profile_block to contain full metadata
@@ -797,46 +1000,156 @@ class PdfParsingService:
         if not structure.metadata: structure.metadata = {}
         team = []
         seen_names = set()
+        seen_orcids: Dict[str, int] = {}
+        seen_name_companion: Dict[Tuple[str, str], int] = {}
+        seen_short_companion: Dict[Tuple[str, str], int] = {}
         
         # We need to collect ALL profile information and then deduplicate
         all_text = "\n".join([b.text for b in zone.blocks])
         
         # Detect individual profile entries
-        # Profiles usually start with "Пан" or "Пані" or a name in Zone 6
-        profile_splits = re.split(r"(?=(?:Пан|Пані)\s+[А-ЯЄІЇҐ])", all_text)
+        # Profiles usually start with "Пан" or "Пані" or "Професор" or "Доктор" or a name in Zone 6
+        split_pattern = r"(?=(?:Пан|Пані|Професор|Доктор|К\.т\.н\.|Д\.т\.н\.|Ph\.D\.)\s+[А-ЯЄІЇҐ])"
+        profile_splits = re.split(split_pattern, all_text)
         
+        # Count potential profile starts for completeness check
+        detected_starts = len(re.findall(split_pattern, all_text))
+        unresolved_starts = []
+        unresolved_pages = []
+        
+        # Track pages for unresolved starts
+        current_char = 0
+        for m in re.finditer(split_pattern, all_text):
+            start_pos = m.start()
+            # Find page number for this position
+            p_num = zone.page_start
+            char_acc = 0
+            for b in zone.blocks:
+                char_acc += len(b.text) + 1
+                if char_acc > start_pos:
+                    p_num = b.page_number
+                    break
+            # We'll use this later to find unresolved ones
+            
+        def _normalize_identity_text(value: Optional[str]) -> str:
+            if not value:
+                return ""
+            normalized = value.strip().lower().replace("’", "'")
+            normalized = re.sub(r"\s+", " ", normalized)
+            normalized = re.sub(r"[^\w\s\-']", "", normalized)
+            return normalized
+
+        def _short_name_signature(name_value: str) -> str:
+            parts = [p for p in name_value.split() if p]
+            if len(parts) < 2:
+                return ""
+            surname = parts[0]
+            initials = "".join(p[0] for p in parts[1:] if p and p[0].isalpha())
+            return f"{surname} {initials}".strip()
+
         for entry in profile_splits:
             if not entry.strip(): continue
             
             # Extract name
-            name_match = re.search(r"(?:Пан|Пані)\s+([А-ЯЄІЇҐ][а-яєіїґ]+\s+[А-ЯЄІЇҐ][а-яєіїґ]+\s*[А-ЯЄІЇҐ]?[а-яєіїґ]*)", entry)
+            name_match = re.search(r"(?:Пан|Пані|Професор|Доктор|К\.т\.н\.|Д\.т\.н\.|Ph\.D\.)\s+([А-ЯЄІЇҐ][а-яєіїґ]+\s+[А-ЯЄІЇҐ][а-яєіїґ]+\s*[А-ЯЄІЇҐ]?[а-яєіїґ]*)", entry)
             if not name_match:
-                # Fallback for names without honorifics
+                # Fallback for names without honorifics - look for Uppercase Word + Uppercase Word
                 name_match = re.search(r"^([А-ЯЄІЇҐ][а-яєіїґ]+\s+[А-ЯЄІЇҐ][а-яєіїґ]+(?:\s+[А-ЯЄІЇҐ][а-яєіїґ]+)?)", entry.strip())
             
             if name_match:
-                name = name_match.group(1).strip()
-                norm_name = name.lower()
+                raw_name = name_match.group(1).strip()
+                name, title, degree = SemanticValidator.clean_name_and_get_titles(name_match.group(0))
+                norm_name = _normalize_identity_text(name)
                 
-                if norm_name not in seen_names and 5 < len(name) < 100:
+                if 5 < len(name) < 100:
                     # Extract other fields for this person if possible
-                    person_data = {"name": name}
+                    person_data = {
+                        "name": name,
+                        "title": title,
+                        "degree": degree
+                    }
                     
                     labels = {
                         "orcid": r"ORCID",
-                        "degree": r"Науковий\s+ступінь",
-                        "position": r"Посада"
+                        "degree_raw": r"Науковий\s+ступінь",
+                        "position": r"Посада",
+                        "institution": r"Місце\s+роботи"
                     }
                     
                     for field, pat in labels.items():
                         m = re.search(pat + r"\s*:?\s*(.+)", entry, re.IGNORECASE)
                         if m:
-                            person_data[field] = m.group(1).strip().split("\n")[0]
+                            val = m.group(1).strip().split("\n")[0]
+                            if field == "orcid":
+                                norm_orcid, raw_orcid = SemanticValidator.normalize_orcid(val)
+                                person_data["orcid"] = norm_orcid
+                                person_data["orcid_raw"] = raw_orcid
+                            else:
+                                # Normalization for institution vs position
+                                if field == "position" and any(inst_kw in val.lower() for inst_kw in ["університет", "інститут", "академія"]):
+                                    # Might be swapped or mixed
+                                    pass
+                                person_data[field] = val
                     
-                    team.append(person_data)
-                    seen_names.add(norm_name)
-        
+                    # Ensure degree is populated if found in labels but not in name
+                    if not person_data.get("degree") and person_data.get("degree_raw"):
+                        person_data["degree"] = person_data["degree_raw"]
+
+                    orcid_norm = _normalize_identity_text(person_data.get("orcid"))
+                    companion_parts = [
+                        _normalize_identity_text(person_data.get("position")),
+                        _normalize_identity_text(person_data.get("degree")),
+                        _normalize_identity_text(person_data.get("institution")),
+                    ]
+                    companion_key = "|".join([p for p in companion_parts if p])
+                    short_name = _short_name_signature(norm_name)
+
+                    duplicate_idx = None
+                    if orcid_norm and orcid_norm in seen_orcids:
+                        duplicate_idx = seen_orcids[orcid_norm]
+                    elif companion_key and (norm_name, companion_key) in seen_name_companion:
+                        duplicate_idx = seen_name_companion[(norm_name, companion_key)]
+                    elif companion_key and short_name and (short_name, companion_key) in seen_short_companion:
+                        # Conservative variant merge: same companion fields + same surname/initials signature.
+                        duplicate_idx = seen_short_companion[(short_name, companion_key)]
+                    elif norm_name in seen_names:
+                        duplicate_idx = next(
+                            (idx for idx, existing in enumerate(team)
+                             if _normalize_identity_text(existing.get("name")) == norm_name),
+                            None
+                        )
+
+                    if duplicate_idx is None:
+                        team.append(person_data)
+                        idx = len(team) - 1
+                        seen_names.add(norm_name)
+                        if orcid_norm:
+                            seen_orcids[orcid_norm] = idx
+                        if companion_key:
+                            seen_name_companion[(norm_name, companion_key)] = idx
+                            if short_name:
+                                seen_short_companion[(short_name, companion_key)] = idx
+                    else:
+                        # Merge missing deterministic fields into the existing canonical profile.
+                        existing = team[duplicate_idx]
+                        for field_name, field_value in person_data.items():
+                            if field_value and not existing.get(field_name):
+                                existing[field_name] = field_value
+                else:
+                    # Could be a duplicate or invalid name
+                    pass
+            else:
+                # Unresolved start
+                unresolved_starts.append(entry[:50].strip())
+                # Find page for this entry if possible
+                
         structure.metadata["team_profiles"] = team
+        structure.metadata["team_profile_completeness"] = {
+            "detected_starts": detected_starts,
+            "extracted_entities": len(team),
+            "unresolved_starts": unresolved_starts,
+            "unresolved_pages": list(set(unresolved_pages))
+        }
 
         # RECONSTRUCT BLOCKS: One profile_block per person
         new_blocks = []
@@ -1078,6 +1391,156 @@ class PdfParsingService:
              return "Detected (English)"
              
         return None
+
+    def _extract_zone1_metadata(self, zone: Optional[DocumentZone], pages_text: List[str]) -> Dict[str, str]:
+        """Deterministically extract structured fields from Zone 1 (header/registration)."""
+        if not zone:
+            return {}
+
+        lines = [b.text.strip() for b in zone.blocks if b.text and b.text.strip()]
+        if not lines:
+            return {}
+
+        field_specs = [
+            ("research_type", r"^Характер\s+досліджень\s*:?\s*(.*)$"),
+            ("grant_type", r"^Вид\s+грантової\s+підтримки\s*:?\s*(.*)$"),
+            ("support_direction", r"^Напрям\s+грантової\s+підтримки\s*:?\s*(.*)$"),
+            ("scientific_direction", r"^Науковий\s+напрям\s*:?\s*(.*)$"),
+            ("speciality", r"^Спеціальність\s*:?\s*(.*)$"),
+            ("application_id", r"^Реєстраційний\s+номер\s+проєкту\s*:?\s*(.*)$"),
+        ]
+
+        label_patterns = [re.compile(pat, re.IGNORECASE) for _, pat in field_specs]
+
+        def _normalize_value(value: str) -> str:
+            cleaned = re.sub(r"\s+", " ", value).strip()
+            cleaned = re.sub(r"^\-\s*", "", cleaned).strip()
+            return cleaned
+
+        extracted: Dict[str, str] = {}
+        for idx, line in enumerate(lines):
+            for field, pattern in field_specs:
+                if field in extracted:
+                    continue
+
+                match = re.match(pattern, line, re.IGNORECASE)
+                if not match:
+                    continue
+
+                value = _normalize_value(match.group(1) or "")
+                if not value and idx + 1 < len(lines):
+                    next_line = lines[idx + 1]
+                    is_next_label = any(lp.match(next_line) for lp in label_patterns)
+                    if not is_next_label:
+                        value = _normalize_value(next_line)
+
+                if value:
+                    extracted[field] = value
+
+        if "application_id" not in extracted:
+            search_text = "\n".join(lines)
+            fallback_id = self._extract_registration_number(search_text)
+            if not fallback_id and pages_text:
+                fallback_id = self._extract_registration_number(pages_text[0])
+            if fallback_id:
+                extracted["application_id"] = fallback_id
+
+        return extracted
+
+    def _is_subsection_header(self, text: str) -> bool:
+        """
+        Detect subsection headers (e.g., "Анотація проєкту", "Мета", "Завдання").
+        Rules:
+        - starts with uppercase
+        - no sentence-ending punctuation
+        - must match explicit known header patterns
+        - avoid classifying short narrative starters as headers
+        """
+        text = text.strip()
+        if not text:
+            return False
+
+        words = text.split()
+        if len(words) < 1 or len(words) > 8:
+            return False
+
+        if not text[0].isupper():
+            return False
+
+        if text.endswith(".") or text.endswith(":") or text.endswith(";") or text.endswith("?") or text.endswith("!"):
+            return False
+
+        # Guardrail against common sentence starters that were previously over-classified.
+        banned_single_word = {"При", "Це", "Етап", "Виготовлення", "Можливість"}
+        if len(words) == 1 and text in banned_single_word:
+            return False
+
+        # Explicit known NRFU subsection headers (narrative metadata anchors).
+        explicit_headers = [
+            r"Анотація\s+проєкту",
+            r"Короткий\s+опис\s+проєкту",
+            r"Ключові\s+слова",
+            r"Мета(?:\s+наукового)?\s+проєкту",
+            r"Мета",
+            r"Основні\s+завдання\s+проєкту",
+            r"Завдання(?:\s+проєкту)?",
+            r"Актуальність\s+проєкту",
+            r"Новизна\s+проєкту",
+            r"Методи\s+досліджень",
+            r"Очікувані\s+результати",
+            r"Практичне\s+значення",
+            r"Ризики",
+            r"Дорожня\s+карта",
+        ]
+
+        for pat in explicit_headers:
+            if re.search(r"^" + pat + r"$", text, re.IGNORECASE):
+                return True
+
+        # Numeric-form headers are already handled earlier as section_header (3.x patterns).
+        return False
+
+    def _is_foreign_structured_content(self, text: str) -> bool:
+        """Detect questionnaire/profile/table patterns in narrative blocks."""
+        patterns = [
+            r"АНКЕТА\s+відповідності",
+            r"Чи\s+має",
+            r"Чи\s+був",
+            r"Прізвище,\s+ім’я,\s+по\s+батькові",
+            r"Науковий\s+ступінь",
+            r"Вчене\s+звання",
+            r"Місце\s+роботи",
+            r"Посада",
+            r"ORCID",
+            r"Scopus\s+Author\s+ID",
+            r"Researcher\s+ID",
+            r"Google\s+Scholar",
+            r"Цитування",
+            r"Індекс\s+Хірша",
+            r"Рік\s+захисту",
+            r"Дата\s+народження",
+            r"Контактний\s+телефон",
+            r"Адреса\s+електронної\s+пошти",
+        ]
+        
+        # Explicit form headings
+        if re.search(r"АНКЕТА\s+відповідності", text, re.IGNORECASE):
+            return True
+            
+        matches = 0
+        for pat in patterns:
+            if re.search(pat, text, re.IGNORECASE):
+                matches += 1
+        
+        # Increased threshold or explicit questionnaire wording
+        if matches >= 2:
+            return True
+            
+        # Checklist patterns like repeated yes/no or numbered criteria
+        if re.search(r"Так\s*/\s*Ні", text, re.IGNORECASE) and len(text) < 200:
+            return True
+            
+        return False
 
     def _extract_project_title(self, text: str) -> str:
         # Heuristic: search for "Назва проєкту" or "Project title"

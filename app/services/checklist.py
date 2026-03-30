@@ -4,6 +4,30 @@ from app.models.models import SubmittedFile, Call, ApplicationPackage, Checklist
 from app.core.logger import logger
 
 class ChecklistService:
+    def _get_sections_for_consumption(self, parsing_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Canonical section path: parsing_result["structure"]["zones"][*]["sections"].
+        Legacy fallback: parsing_result["sections"].
+        """
+        structure = parsing_result.get("structure") or {}
+        zones = structure.get("zones") if isinstance(structure, dict) else None
+        if isinstance(zones, list):
+            canonical_sections: List[Dict[str, Any]] = []
+            for zone in zones:
+                if not isinstance(zone, dict):
+                    continue
+                zone_sections = zone.get("sections") or []
+                if isinstance(zone_sections, list):
+                    canonical_sections.extend([s for s in zone_sections if isinstance(s, dict)])
+            if canonical_sections:
+                return canonical_sections
+
+        # Backward-compatibility path for older parsing_result payloads.
+        legacy_sections = parsing_result.get("sections", [])
+        if isinstance(legacy_sections, list):
+            return [s for s in legacy_sections if isinstance(s, dict)]
+        return []
+
     def _extract_source_passage(self, document: CallDocument, section_keyword: str) -> str:
         """
         Extract a short snippet around the section keyword from the source document.
@@ -14,7 +38,7 @@ class ChecklistService:
         
         text = document.extracted_text
         parsing_result = document.parsing_result or {}
-        sections = parsing_result.get("sections", [])
+        sections = self._get_sections_for_consumption(parsing_result)
         
         # Try to find the section in structured data first
         if sections:
