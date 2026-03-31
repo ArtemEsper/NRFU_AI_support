@@ -195,6 +195,39 @@ class PageClassification(BaseModel):
     type: str  # content, marker_only, marker_plus_content
     anchors: List[str] = []
 
+class TablePageClassification(BaseModel):
+    page_number: int
+    page_class: str  # native_text, native_text_complex_table, scanned_image_only
+    confidence: float = 0.0
+    signals: dict = {}
+
+class CanonicalTableColumn(BaseModel):
+    col_id: str
+    name: str
+    semantic_type: str = "string"
+
+class CanonicalTableCell(BaseModel):
+    col_id: str
+    text: str
+    normalized: Optional[Any] = None
+
+class CanonicalTableRow(BaseModel):
+    row_id: str
+    cells: List[CanonicalTableCell] = []
+
+class CanonicalTable(BaseModel):
+    table_id: str
+    table_family: str
+    zone_type: str
+    title: str
+    page_start: int
+    page_end: int
+    source: dict = {}
+    columns: List[CanonicalTableColumn] = []
+    rows: List[CanonicalTableRow] = []
+    spans: List[dict] = []
+    validation: dict = {}
+
 class DocumentZone(BaseModel):
     name: str
     zone_type: str
@@ -213,6 +246,8 @@ class ParsedDocumentStructure(BaseModel):
     zones: List[DocumentZone] = []
     detected_anchors: List[dict] = [] # list of {text, page, match}
     page_classifications: List[PageClassification] = []
+    page_table_classifications: List[TablePageClassification] = []
+    tables: List[CanonicalTable] = []
     metadata: Optional[dict] = None
     pages: List[str] = []
     debug_log: List[str] = []

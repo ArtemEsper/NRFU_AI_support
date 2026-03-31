@@ -7,7 +7,18 @@ import json
 import logging
 from app.core.logger import logger
 from app.services.layout_enrichment import LayoutEnrichmentService
-from app.schemas.schemas import DocumentZone, DocumentSection, ParsedDocumentStructure, PageClassification, DocumentBlock
+from app.schemas.schemas import (
+    DocumentZone,
+    DocumentSection,
+    ParsedDocumentStructure,
+    PageClassification,
+    DocumentBlock,
+    TablePageClassification,
+    CanonicalTable,
+    CanonicalTableColumn,
+    CanonicalTableRow,
+    CanonicalTableCell,
+)
 
 class SemanticValidator:
     """Helper class for semantic validation of extracted fields."""
@@ -139,8 +150,9 @@ class PdfParsingService:
         # by only using them for debug signals, which is already the case as they are 
         # returned in 'markers' but not used in _reconstruct_structure anchor_defs.
 
+        page_table_classifications = self._classify_pages_for_tables(doc, pages_text)
         # Deterministic Zone/Section Reconstruction
-        structure = self._reconstruct_structure(doc, pages_text, full_text)
+        structure = self._reconstruct_structure(doc, pages_text, full_text, page_table_classifications)
         
         page_map: Dict[int, List[str]] = {}
         for zone in structure.zones:
@@ -166,6 +178,8 @@ class PdfParsingService:
 
         parsing_result = {
             "structure": normalized_structure,
+            "tables": [t.model_dump() for t in structure.tables],
+            "page_table_classifications": [c.model_dump() for c in structure.page_table_classifications],
             # Legacy compatibility projection. Canonical consumer path is parsing_result["structure"].
             "sections": [s.model_dump() for zone in structure.zones for s in zone.sections],
             "page_map": page_map,
@@ -229,13 +243,82 @@ class PdfParsingService:
             "parsing_result": parsing_result
         }
 
-    def _reconstruct_structure(self, doc: fitz.Document, pages_text: List[str], full_text: str = "") -> ParsedDocumentStructure:
+    def _classify_pages_for_tables(self, doc: fitz.Document, pages_text: List[str]) -> List[TablePageClassification]:
+        classifications: List[TablePageClassification] = []
+
+        keywords = [
+            "обсяг фінансування",
+            "етапи фінансування",
+            "таблиця",
+            "бюджет",
+            "кошторис",
+        ]
+
+        for idx, page_text in enumerate(pages_text):
+            page = doc.load_page(idx)
+            page_rect = page.rect
+            page_area = float(max(page_rect.width * page_rect.height, 1.0))
+            text = page_text or ""
+            text_len = len(text.strip())
+            word_count = len(re.findall(r"\w+", text, flags=re.UNICODE))
+            digits = sum(ch.isdigit() for ch in text)
+            digit_ratio = digits / max(len(text), 1)
+
+            image_area = 0.0
+            try:
+                for block in page.get_text("dict").get("blocks", []):
+                    if block.get("type") == 1 and block.get("bbox"):
+                        x0, y0, x1, y1 = block["bbox"]
+                        image_area += max((x1 - x0), 0) * max((y1 - y0), 0)
+            except Exception:
+                image_area = 0.0
+
+            image_area_ratio = image_area / page_area
+            low_text = text.lower()
+            has_financial_keyword = any(kw in low_text for kw in keywords)
+
+            if word_count < 20 and image_area_ratio > 0.4:
+                page_class = "scanned_image_only"
+                confidence = 0.95
+            elif word_count < 20 and text_len == 0:
+                # Keep explicit scan suspicion for pages with no extractable text.
+                page_class = "scanned_image_only"
+                confidence = 0.75
+            elif has_financial_keyword or (digit_ratio > 0.12 and word_count > 20):
+                page_class = "native_text_complex_table"
+                confidence = 0.9 if has_financial_keyword else 0.75
+            else:
+                page_class = "native_text"
+                confidence = 0.9
+
+            classifications.append(TablePageClassification(
+                page_number=idx + 1,
+                page_class=page_class,
+                confidence=round(confidence, 3),
+                signals={
+                    "word_count": word_count,
+                    "digit_ratio": round(digit_ratio, 4),
+                    "image_area_ratio": round(image_area_ratio, 4),
+                    "has_financial_keyword": has_financial_keyword,
+                },
+            ))
+
+        return classifications
+
+    def _reconstruct_structure(
+        self,
+        doc: fitz.Document,
+        pages_text: List[str],
+        full_text: str = "",
+        page_table_classifications: Optional[List[TablePageClassification]] = None
+    ) -> ParsedDocumentStructure:
         """
         Implements deterministic zone/section reconstruction based on NRFU Spec (Master Spec).
         Strictly follows Zone Boundary Rules and page-based transition semantics.
         """
         structure = ParsedDocumentStructure()
         structure.pages = pages_text
+        structure.page_table_classifications = page_table_classifications or []
         debug_log = []
         
         # Define anchors and their classification behaviors
@@ -1712,39 +1795,263 @@ class PdfParsingService:
                     return amount, lines[j]
             return None, None
 
+        def _is_non_numeric_label(text: str) -> bool:
+            if not text:
+                return False
+            low = text.lower()
+            if "обсяг фінансування" in low or "термін реалізації" in low:
+                return True
+            return _parse_amount(text) is None
+
+        def _to_cell(col_id: str, text_value: str, normalized_value: Any = None) -> CanonicalTableCell:
+            return CanonicalTableCell(col_id=col_id, text=text_value, normalized=normalized_value)
+
+        def _build_table_rows(entries: List[Tuple[str, Optional[str], Optional[Any]]]) -> List[CanonicalTableRow]:
+            rows: List[CanonicalTableRow] = []
+            for idx, (label, raw_value, norm_value) in enumerate(entries):
+                value_text = raw_value or ""
+                rows.append(
+                    CanonicalTableRow(
+                        row_id=f"r{idx}",
+                        cells=[
+                            _to_cell("c0", label, label),
+                            _to_cell("c1", value_text, norm_value),
+                        ],
+                    )
+                )
+            return rows
+
+        def _extract_year_stage(label_text: str) -> Tuple[Optional[int], Optional[int]]:
+            low = (label_text or "").lower()
+            year_num = None
+            if "перш" in low:
+                year_num = 1
+            elif "друг" in low:
+                year_num = 2
+            elif "трет" in low:
+                year_num = 3
+            stage_match = re.search(r"\bетап\s*(\d+)\b", low)
+            if not stage_match:
+                stage_match = re.search(r"(\d+)\s*[-–—]?\s*етап\b", low)
+            stage_num = int(stage_match.group(1)) if stage_match else None
+            return year_num, stage_num
+
+        # Split financial lines into summary and stage segments using the in-page heading.
+        summary_heading_idx = next((i for i, l in enumerate(lines) if re.search(r"^обсяг\s+фінансування\s*$", l, re.IGNORECASE)), None)
+        stage_heading_idx = next((i for i, l in enumerate(lines) if re.search(r"^етапи\s+фінансування\s*$", l, re.IGNORECASE)), None)
+        summary_lines = lines[:]
+        stage_lines: List[str] = []
+
+        if summary_heading_idx is not None:
+            summary_lines = lines[summary_heading_idx + 1:]
+        if stage_heading_idx is not None:
+            stage_lines = lines[stage_heading_idx + 1:]
+            if summary_heading_idx is not None and stage_heading_idx > summary_heading_idx:
+                summary_lines = lines[summary_heading_idx + 1:stage_heading_idx]
+            else:
+                summary_lines = [l for l in lines if not re.search(r"^етапи\s+фінансування\s*$", l, re.IGNORECASE)]
+
+        # Build summary table rows (label -> value).
+        summary_entries: List[Tuple[str, Optional[str], Optional[Any]]] = []
+        i = 0
+        while i < len(summary_lines):
+            label = summary_lines[i]
+            low = label.lower()
+            if "обсяг фінансування" in low or re.search(r"^термін\s+реалізації\s+проєкту", low):
+                raw_value = summary_lines[i + 1] if i + 1 < len(summary_lines) else None
+                norm_value: Any = raw_value
+                parsed = _parse_amount(raw_value or "")
+                if parsed is not None:
+                    norm_value = parsed
+                summary_entries.append((label, raw_value, norm_value))
+                i += 2
+                continue
+            i += 1
+
+        # Build stage table rows (label -> amount, when available).
+        stage_entries: List[Tuple[str, Optional[str], Optional[Any]]] = []
+        i = 0
+        while i < len(stage_lines):
+            label = stage_lines[i]
+            low = label.lower()
+            if "етап" in low and "обсяг фінансування" in low:
+                raw_value = None
+                norm_value: Any = None
+                if i + 1 < len(stage_lines) and not _is_non_numeric_label(stage_lines[i + 1]):
+                    raw_value = stage_lines[i + 1]
+                    parsed = _parse_amount(raw_value)
+                    if parsed is not None:
+                        norm_value = parsed
+                    i += 2
+                else:
+                    i += 1
+                stage_entries.append((label, raw_value, norm_value))
+                continue
+            i += 1
+
+        page_cls = next((c for c in structure.page_table_classifications if c.page_number == zone.page_start), None)
+        page_class = page_cls.page_class if page_cls else "native_text"
+        page_confidence = page_cls.confidence if page_cls else 0.8
+        source = {
+            "parser": "pymupdf_native",
+            "page_class": page_class,
+            "confidence": page_confidence,
+        }
+
+        summary_table = CanonicalTable(
+            table_id=f"tbl_financial_summary_p{zone.page_start:03d}_01",
+            table_family="financial_funding_summary",
+            zone_type="financial",
+            title="Обсяг фінансування",
+            page_start=zone.page_start,
+            page_end=zone.page_end or zone.page_start,
+            source=source,
+            columns=[
+                CanonicalTableColumn(col_id="c0", name="label", semantic_type="string"),
+                CanonicalTableColumn(col_id="c1", name="value", semantic_type="string_or_amount"),
+            ],
+            rows=_build_table_rows(summary_entries),
+            spans=[],
+            validation={
+                "row_count": len(summary_entries),
+                "column_count": 2,
+                "normalization_warnings": [],
+            },
+        )
+
+        stage_table = CanonicalTable(
+            table_id=f"tbl_financial_stages_p{zone.page_start:03d}_02",
+            table_family="financial_stage_amounts",
+            zone_type="financial",
+            title="Етапи фінансування",
+            page_start=zone.page_start,
+            page_end=zone.page_end or zone.page_start,
+            source=source,
+            columns=[
+                CanonicalTableColumn(col_id="c0", name="stage_label", semantic_type="string"),
+                CanonicalTableColumn(col_id="c1", name="amount_uah", semantic_type="currency_uah_int"),
+            ],
+            rows=_build_table_rows(stage_entries),
+            spans=[],
+            validation={
+                "row_count": len(stage_entries),
+                "column_count": 2,
+                "normalization_warnings": [],
+            },
+        )
+
+        yearly_rows: List[CanonicalTableRow] = []
+        for idx, (label, raw_value, norm_value) in enumerate(summary_entries):
+            if "рік" not in (label or "").lower():
+                continue
+            year_num, stage_num = _extract_year_stage(label)
+            yearly_rows.append(
+                CanonicalTableRow(
+                    row_id=f"r{idx}",
+                    cells=[
+                        CanonicalTableCell(col_id="c0", text=label, normalized=label),
+                        CanonicalTableCell(col_id="c1", text=str(year_num) if year_num is not None else "", normalized=year_num),
+                        CanonicalTableCell(col_id="c2", text=raw_value or "", normalized=norm_value),
+                        CanonicalTableCell(col_id="c3", text=str(stage_num) if stage_num is not None else "", normalized=stage_num),
+                    ],
+                )
+            )
+
+        yearly_stage_table = CanonicalTable(
+            table_id=f"tbl_financial_yearly_stages_p{zone.page_start:03d}_03",
+            table_family="financial_yearly_stage_amounts",
+            zone_type="financial",
+            title="Річний розподіл фінансування за етапами",
+            page_start=zone.page_start,
+            page_end=zone.page_end or zone.page_start,
+            source=source,
+            columns=[
+                CanonicalTableColumn(col_id="c0", name="year_stage_label", semantic_type="string"),
+                CanonicalTableColumn(col_id="c1", name="year_number", semantic_type="int"),
+                CanonicalTableColumn(col_id="c2", name="amount_uah", semantic_type="currency_uah_int"),
+                CanonicalTableColumn(col_id="c3", name="stage_number", semantic_type="int"),
+            ],
+            rows=yearly_rows,
+            spans=[],
+            validation={
+                "row_count": len(yearly_rows),
+                "column_count": 4,
+                "normalization_warnings": [],
+            },
+        )
+
+        # Replace previous financial tables for this page (idempotent reruns), then append canonical tables.
+        structure.tables = [
+            t for t in structure.tables
+            if not (
+                t.zone_type == "financial"
+                and t.page_start == zone.page_start
+                and t.table_family in {
+                    "financial_funding_summary",
+                    "financial_stage_amounts",
+                    "financial_yearly_stage_amounts",
+                }
+            )
+        ]
+        structure.tables.extend([summary_table, stage_table, yearly_stage_table])
+
+        # Derive legacy financial_summary from canonical rows where available.
         stage_amounts: Dict[str, int] = {}
         stage_amounts_raw: Dict[str, str] = {}
         total_amount_uah: Optional[int] = None
         total_amount_raw: Optional[str] = None
         project_duration: Optional[str] = None
 
-        for i, line in enumerate(lines):
-            low = line.lower()
+        for row in summary_table.rows:
+            label = (row.cells[0].text if row.cells else "").lower()
+            raw_value = row.cells[1].text if len(row.cells) > 1 else ""
+            normalized = row.cells[1].normalized if len(row.cells) > 1 else None
 
-            if re.search(r"^термін\s+реалізації\s+проєкту", low):
-                if i + 1 < len(lines):
-                    project_duration = lines[i + 1]
+            if "термін реалізації проєкту" in label and raw_value:
+                project_duration = raw_value
 
-            if re.search(r"^обсяг\s+фінансування\s+проєкту\s*$", low):
-                amt, raw_line = _find_next_amount(i)
-                if amt is not None:
-                    total_amount_uah = amt
-                    total_amount_raw = raw_line
+            if re.search(r"^обсяг\s+фінансування\s+проєкту\s*$", label):
+                if isinstance(normalized, int):
+                    total_amount_uah = normalized
+                    total_amount_raw = raw_value
 
-            if "обсяг фінансування" in low:
+            if "обсяг фінансування" in label:
                 stage_num = None
-                if re.search(r"\bперш", low) or re.search(r"\bетап\s*1\b", low):
+                if re.search(r"\bперш", label) or re.search(r"\bетап\s*1\b", label):
                     stage_num = "1"
-                elif re.search(r"\bдруг", low) or re.search(r"\bетап\s*2\b", low):
+                elif re.search(r"\bдруг", label) or re.search(r"\bетап\s*2\b", label):
                     stage_num = "2"
-                elif re.search(r"\bтрет", low) or re.search(r"\bетап\s*3\b", low):
+                elif re.search(r"\bтрет", label) or re.search(r"\bетап\s*3\b", label):
                     stage_num = "3"
+                if stage_num and isinstance(normalized, int):
+                    stage_amounts[stage_num] = normalized
+                    stage_amounts_raw[stage_num] = raw_value
 
-                if stage_num and stage_num not in stage_amounts:
+        # Backward-compatible fallback to prior line-neighbor logic when canonical rows are incomplete.
+        if total_amount_uah is None or not stage_amounts:
+            for i, line in enumerate(lines):
+                low = line.lower()
+                if project_duration is None and re.search(r"^термін\s+реалізації\s+проєкту", low):
+                    if i + 1 < len(lines):
+                        project_duration = lines[i + 1]
+                if total_amount_uah is None and re.search(r"^обсяг\s+фінансування\s+проєкту\s*$", low):
                     amt, raw_line = _find_next_amount(i)
                     if amt is not None:
-                        stage_amounts[stage_num] = amt
-                        stage_amounts_raw[stage_num] = raw_line or ""
+                        total_amount_uah = amt
+                        total_amount_raw = raw_line
+                if "обсяг фінансування" in low:
+                    stage_num = None
+                    if re.search(r"\bперш", low) or re.search(r"\bетап\s*1\b", low):
+                        stage_num = "1"
+                    elif re.search(r"\bдруг", low) or re.search(r"\bетап\s*2\b", low):
+                        stage_num = "2"
+                    elif re.search(r"\bтрет", low) or re.search(r"\bетап\s*3\b", low):
+                        stage_num = "3"
+                    if stage_num and stage_num not in stage_amounts:
+                        amt, raw_line = _find_next_amount(i)
+                        if amt is not None:
+                            stage_amounts[stage_num] = amt
+                            stage_amounts_raw[stage_num] = raw_line or ""
 
         financial_summary = {
             "total_amount_uah": total_amount_uah,
