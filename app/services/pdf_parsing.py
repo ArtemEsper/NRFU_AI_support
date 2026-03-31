@@ -6,6 +6,7 @@ import tempfile
 import json
 import logging
 from app.core.logger import logger
+from app.core.config import settings
 from app.services.layout_enrichment import LayoutEnrichmentService
 from app.schemas.schemas import (
     DocumentZone,
@@ -153,6 +154,8 @@ class PdfParsingService:
         page_table_classifications = self._classify_pages_for_tables(doc, pages_text)
         # Deterministic Zone/Section Reconstruction
         structure = self._reconstruct_structure(doc, pages_text, full_text, page_table_classifications)
+        if settings.USE_LITEPARSE_SCANNED_TABLE_ROUTING:
+            self._augment_scanned_tables_with_liteparse(file_content, structure)
         
         page_map: Dict[int, List[str]] = {}
         for zone in structure.zones:
@@ -304,6 +307,119 @@ class PdfParsingService:
             ))
 
         return classifications
+
+    def _augment_scanned_tables_with_liteparse(self, file_content: bytes, structure: ParsedDocumentStructure):
+        def _zone_for_page(page_number: int) -> Optional[str]:
+            zone = next(
+                (z for z in structure.zones if z.page_start <= page_number <= (z.page_end or z.page_start)),
+                None,
+            )
+            return zone.zone_type if zone else None
+
+        # Narrow pilot: scanned annex/certificate pages only.
+        scanned_pages = [
+            c.page_number
+            for c in structure.page_table_classifications
+            if c.page_class == "scanned_image_only" and _zone_for_page(c.page_number) == "annex"
+        ]
+        if not scanned_pages:
+            return
+
+        if not self.enrichment_service.cli_available:
+            if not structure.metadata:
+                structure.metadata = {}
+            structure.metadata["liteparse_scanned_routing_warning"] = "LiteParse CLI not available; scanned routing skipped."
+            return
+
+        pages_arg = ",".join(str(p) for p in scanned_pages)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_content)
+            tmp_path = tmp.name
+
+        try:
+            liteparse_result = self.enrichment_service.run_liteparse_cli(
+                file_path=tmp_path,
+                pages=pages_arg,
+                dpi=settings.LITEPARSE_HIGH_QUALITY_DPI,
+                ocr_enabled=True,
+            )
+        except Exception as exc:
+            if not structure.metadata:
+                structure.metadata = {}
+            structure.metadata["liteparse_scanned_routing_warning"] = f"LiteParse scanned routing failed: {exc}"
+            return
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        for page_data in liteparse_result.get("pages", []):
+            page_num = page_data.get("page_number") or page_data.get("page")
+            if not isinstance(page_num, int):
+                continue
+
+            cls = next((c for c in structure.page_table_classifications if c.page_number == page_num), None)
+            if not cls or cls.page_class != "scanned_image_only":
+                continue
+
+            raw_text = page_data.get("text") or ""
+            lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines() if ln and ln.strip()]
+            warnings: List[str] = []
+            if not lines:
+                warnings.append("no_text_from_liteparse")
+
+            rows: List[CanonicalTableRow] = []
+            for idx, line in enumerate(lines):
+                rows.append(
+                    CanonicalTableRow(
+                        row_id=f"r{idx}",
+                        cells=[
+                            CanonicalTableCell(col_id="c0", text=str(idx + 1), normalized=idx + 1),
+                            CanonicalTableCell(col_id="c1", text=line, normalized=line),
+                        ],
+                    )
+                )
+
+            page_zone = next(
+                (z for z in structure.zones if z.page_start <= page_num <= (z.page_end or z.page_start)),
+                None,
+            )
+            zone_type = page_zone.zone_type if page_zone else "unknown"
+
+            scanned_table = CanonicalTable(
+                table_id=f"tbl_scanned_liteparse_p{page_num:03d}_01",
+                table_family="scanned_page_ocr_layout",
+                zone_type=zone_type,
+                title="LiteParse OCR Layout Lines",
+                page_start=page_num,
+                page_end=page_num,
+                source={
+                    "parser": "liteparse_cli",
+                    "page_class": cls.page_class,
+                    "confidence": cls.confidence,
+                    "extraction_mode": "scanned_page_only_route",
+                    "warnings": warnings,
+                },
+                columns=[
+                    CanonicalTableColumn(col_id="c0", name="line_number", semantic_type="int"),
+                    CanonicalTableColumn(col_id="c1", name="ocr_text", semantic_type="string"),
+                ],
+                rows=rows,
+                spans=[],
+                validation={
+                    "row_count": len(rows),
+                    "column_count": 2,
+                    "normalization_warnings": warnings,
+                },
+            )
+
+            structure.tables = [
+                t for t in structure.tables
+                if not (
+                    t.table_family == "scanned_page_ocr_layout"
+                    and t.page_start == page_num
+                )
+            ]
+            structure.tables.append(scanned_table)
 
     def _reconstruct_structure(
         self,

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     LITEPARSE_DEFAULT_DPI: int = 150
     LITEPARSE_HIGH_QUALITY_DPI: int = 300
     LITEPARSE_OCR_SERVER_URL: Optional[str] = None
+    USE_LITEPARSE_SCANNED_TABLE_ROUTING: bool = False
 
     # noinspection PyTypeChecker
     model_config = SettingsConfigDict(
