@@ -229,6 +229,43 @@ To enable LiteParse enrichment for complex documents:
 docker compose run --rm -e ENVIRONMENT=test app pytest
 ```
 
+### Running Checklist Tests Locally (DB-free and Containerized)
+
+Checklist tests import the shared DB session setup. If `ENVIRONMENT` is not set to `test`, the app uses PostgreSQL host `db` from `.env`, which is a Docker Compose service name and is usually not resolvable from direct host runs.
+
+- Why `db` is unreachable from host runs:
+  - Default DB host is `POSTGRES_SERVER=db` (Compose network DNS name).
+  - Outside Docker Compose networking, `db` is not a normal host DNS entry.
+- When Docker is needed:
+  - Use Docker when you want the documented containerized workflow or Postgres-backed integration runs.
+- When Docker is not needed:
+  - For local DB-free checklist runs, set `ENVIRONMENT=test` to switch to SQLite test DB files.
+
+Recommended checklist workflow (containerized/documented path):
+```bash
+docker compose run --rm -e ENVIRONMENT=test app pytest tests/test_checklist.py tests/test_checklist_deterministic_rules.py -q
+```
+
+Host-local equivalent (DB-free SQLite):
+```bash
+ENVIRONMENT=test ./.venv/bin/pytest tests/test_checklist.py tests/test_checklist_deterministic_rules.py -q
+```
+
+Optional helper wrapper style (same scope, one command):
+```bash
+CHECKLIST_TESTS="tests/test_checklist.py tests/test_checklist_deterministic_rules.py"
+ENVIRONMENT=test ./.venv/bin/pytest $CHECKLIST_TESTS -q
+```
+
+Tests that can run without DB
+- Parsing/layout-focused tests that do not import `app.db.session` or `app.main` can run DB-free.
+- Typical examples:
+  - `tests/test_parsing_v2.py`
+  - `tests/test_parsing_contract.py`
+  - `tests/test_layout_enrichment.py`
+  - `tests/test_block_ownership.py`
+  - `tests/test_paragraph_reconstruction.py`
+
 ---
 
 ## Roadmap

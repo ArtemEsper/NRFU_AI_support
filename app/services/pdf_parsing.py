@@ -5,6 +5,8 @@ import os
 import tempfile
 import json
 import logging
+from datetime import datetime, timezone
+from uuid import uuid4
 from app.core.logger import logger
 from app.core.config import settings
 from app.services.layout_enrichment import LayoutEnrichmentService
@@ -124,7 +126,12 @@ class PdfParsingService:
     def __init__(self):
         self.enrichment_service = LayoutEnrichmentService()
 
-    async def parse_pdf(self, file_content: bytes) -> Dict[str, Any]:
+    async def parse_pdf(
+        self,
+        file_content: bytes,
+        input_file_name: Optional[str] = None,
+        input_file_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Extract text, page count, and metadata from PDF using PyMuPDF.
         Also performs structured zone/section reconstruction.
@@ -155,7 +162,7 @@ class PdfParsingService:
         # Deterministic Zone/Section Reconstruction
         structure = self._reconstruct_structure(doc, pages_text, full_text, page_table_classifications)
         if settings.USE_LITEPARSE_SCANNED_TABLE_ROUTING:
-            self._augment_scanned_tables_with_liteparse(file_content, structure)
+            self._augment_scanned_tables_with_liteparse(file_content, structure, pages_text)
         
         page_map: Dict[int, List[str]] = {}
         for zone in structure.zones:
@@ -223,8 +230,19 @@ class PdfParsingService:
         if enrichment_result:
             parsing_result["enrichment"] = enrichment_result.model_dump()
         
+        debug_artifact_path: Optional[str] = None
         # Save full debug JSON if needed (includes full text)
         if os.getenv("DEBUG_PARSING") == "true":
+            page_inspection_summary = self._build_page_inspection_summary(structure)
+            self._save_debug_json(page_inspection_summary, filename="page_inspection_summary.json")
+
+            debug_artifact = self._build_canonical_debug_artifact(
+                parsing_result=parsing_result,
+                input_file_name=input_file_name,
+                input_file_path=input_file_path,
+            )
+            debug_artifact_path = self._save_canonical_debug_artifact(debug_artifact)
+
             full_result = parsing_result.copy()
             full_result["full_pages_text"] = pages_text
             self._save_debug_json(full_result, filename="debug_parse_output.json")
@@ -243,11 +261,13 @@ class PdfParsingService:
             "detected_call_title": call_title,
             "detected_project_title": project_title,
             "detected_language_note": "Parsed with structured reconstruction",
+            "debug_artifact_path": debug_artifact_path,
             "parsing_result": parsing_result
         }
 
     def _classify_pages_for_tables(self, doc: fitz.Document, pages_text: List[str]) -> List[TablePageClassification]:
         classifications: List[TablePageClassification] = []
+        page_rows: List[Dict[str, Any]] = []
 
         keywords = [
             "обсяг фінансування",
@@ -294,21 +314,1685 @@ class PdfParsingService:
                 page_class = "native_text"
                 confidence = 0.9
 
+            page_rows.append({
+                "page_number": idx + 1,
+                "page_class": page_class,
+                "confidence": confidence,
+                "word_count": word_count,
+                "digit_ratio": digit_ratio,
+                "image_area_ratio": image_area_ratio,
+                "is_landscape": bool(page_rect.width > page_rect.height),
+                "page_aspect_ratio": float(page_rect.width / max(page_rect.height, 1.0)),
+                "has_financial_keyword": has_financial_keyword,
+            })
+
+        scanned_pages = [int(r["page_number"]) for r in page_rows if r["page_class"] == "scanned_image_only"]
+        scanned_ocr_text = self._get_scanned_page_ocr_snippets(doc, scanned_pages)
+        family_scoring_texts = list(pages_text)
+        for page_num, snippet in scanned_ocr_text.items():
+            idx = page_num - 1
+            if 0 <= idx < len(family_scoring_texts) and snippet.strip():
+                family_scoring_texts[idx] = snippet
+
+        for row in page_rows:
+            page_num = int(row["page_number"])
+            page_idx = page_num - 1
+            page_class = str(row["page_class"])
+            page_confidence = float(row["confidence"])
+            signals = {
+                "word_count": int(row["word_count"]),
+                "digit_ratio": round(float(row["digit_ratio"]), 4),
+                "image_area_ratio": round(float(row["image_area_ratio"]), 4),
+                "is_landscape": bool(row["is_landscape"]),
+                "page_aspect_ratio": round(float(row["page_aspect_ratio"]), 4),
+                "has_financial_keyword": bool(row["has_financial_keyword"]),
+            }
+
+            if page_class == "scanned_image_only":
+                scored_text = family_scoring_texts[page_idx] if 0 <= page_idx < len(family_scoring_texts) else ""
+                scored_word_count = len(re.findall(r"\w+", scored_text, flags=re.UNICODE))
+                scored_digit_ratio = sum(ch.isdigit() for ch in scored_text) / max(len(scored_text), 1)
+                family_hint, family_confidence, family_signals = self._classify_scanned_page_family(
+                    page_index=page_idx,
+                    pages_text=family_scoring_texts,
+                    word_count=scored_word_count,
+                    digit_ratio=scored_digit_ratio,
+                )
+                signals["scanned_family_hint"] = family_hint
+                signals["scanned_family_confidence"] = round(family_confidence, 3)
+                signals["scanned_family_signals"] = family_signals
+                signals["scanned_family_text_source"] = (
+                    "liteparse_ocr_snippet" if page_num in scanned_ocr_text and bool(scanned_ocr_text[page_num].strip()) else "native_extracted_text"
+                )
+                signals["scanned_family_ocr_text_len"] = len(scanned_ocr_text.get(page_num, ""))
+                cert_evidence_ocr = self._extract_scanned_certificate_reference_evidence(scored_text)
+                vision_candidate = bool(
+                    settings.USE_SCANNED_CERT_VISION_EVIDENCE
+                    and (
+                        family_hint == "certificate_reference_evidence"
+                        or bool(family_signals.get("certificate_keyword_detected"))
+                        or bool(family_signals.get("primary_employment_phrase_detected"))
+                        or float(family_signals.get("certificate_score", 0.0) or 0.0) >= 0.35
+                    )
+                )
+                signals["certificate_vision_candidate"] = vision_candidate
+                cert_evidence_vision: Dict[str, Any] = {}
+                if vision_candidate:
+                    cert_evidence_vision = self._extract_scanned_certificate_reference_evidence_vision(doc, page_num)
+                    signals["certificate_vision_evidence_source"] = cert_evidence_vision.get("evidence_source", "none")
+                merged_cert_evidence = self._merge_certificate_evidence(cert_evidence_ocr, cert_evidence_vision)
+                if merged_cert_evidence:
+                    signals["certificate_reference_evidence"] = merged_cert_evidence
+                    signals["certificate_evidence_source"] = merged_cert_evidence.get("evidence_source") or "ocr_text_patterns"
+                    signals["certificate_evidence_lanes"] = {
+                        "ocr_available": bool(cert_evidence_ocr),
+                        "vision_available": bool(cert_evidence_vision),
+                        "ocr_confidence": float(cert_evidence_ocr.get("confidence", 0.0) or 0.0) if cert_evidence_ocr else 0.0,
+                        "vision_confidence": float(cert_evidence_vision.get("confidence", 0.0) or 0.0) if cert_evidence_vision else 0.0,
+                    }
+                    if signals.get("scanned_family_hint") != "certificate_reference_evidence":
+                        ev_conf = float(merged_cert_evidence.get("confidence", 0.0) or 0.0)
+                        if ev_conf >= 0.45:
+                            signals["scanned_family_hint"] = "certificate_reference_evidence"
+                            signals["scanned_family_confidence"] = round(max(float(signals.get("scanned_family_confidence", 0.0) or 0.0), ev_conf), 3)
+                else:
+                    signals["certificate_evidence_source"] = "none"
+                    signals["certificate_evidence_lanes"] = {
+                        "ocr_available": bool(cert_evidence_ocr),
+                        "vision_available": bool(cert_evidence_vision),
+                    }
+                signals["routing_decision"] = "scanned_supporting_misc"
+                signals["routing_reasons"] = ["default_scanned_classification"]
+                signals["continuation_context_source"] = "none"
+
             classifications.append(TablePageClassification(
-                page_number=idx + 1,
+                page_number=page_num,
                 page_class=page_class,
-                confidence=round(confidence, 3),
-                signals={
-                    "word_count": word_count,
-                    "digit_ratio": round(digit_ratio, 4),
-                    "image_area_ratio": round(image_area_ratio, 4),
-                    "has_financial_keyword": has_financial_keyword,
-                },
+                confidence=round(page_confidence, 3),
+                signals=signals,
             ))
 
         return classifications
 
-    def _augment_scanned_tables_with_liteparse(self, file_content: bytes, structure: ParsedDocumentStructure):
+    def _get_scanned_page_ocr_snippets(
+        self,
+        doc: fitz.Document,
+        scanned_pages: List[int],
+    ) -> Dict[int, str]:
+        if not scanned_pages:
+            return {}
+        if not settings.LITEPARSE_OCR_ENABLED:
+            return {}
+        if not self.enrichment_service.cli_available:
+            return {}
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp_path = tmp.name
+        tmp.close()
+        snippets: Dict[int, str] = {}
+        try:
+            doc.save(tmp_path)
+            pages_arg = ",".join(str(p) for p in sorted(set(scanned_pages)))
+            result = self.enrichment_service.run_liteparse_cli(
+                file_path=tmp_path,
+                pages=pages_arg,
+                dpi=settings.LITEPARSE_HIGH_QUALITY_DPI,
+                ocr_enabled=True,
+            )
+            for page_data in result.get("pages", []):
+                p = page_data.get("page_number") or page_data.get("page")
+                if not isinstance(p, int):
+                    continue
+                text = str(page_data.get("text") or "").strip()
+                if text:
+                    snippets[p] = text
+        except Exception:
+            return {}
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return snippets
+
+    def _collect_supporting_phrases(self, text: str) -> List[str]:
+        if not text:
+            return []
+        cues = [
+            "довідка",
+            "за основним місцем роботи",
+            "довідка видана",
+            "на пред'явлення",
+            "для подання",
+            "національний фонд досліджень україни",
+            "працює",
+        ]
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln and ln.strip()]
+        phrases: List[str] = []
+        for line in lines:
+            low = line.lower()
+            if any(cue in low for cue in cues):
+                phrases.append(line)
+        deduped: List[str] = []
+        for p in phrases:
+            if p not in deduped:
+                deduped.append(p)
+        return deduped[:8]
+
+    def _extract_text_with_liteparse_ocr_from_image(self, image_path: str) -> str:
+        if not self.enrichment_service.cli_available:
+            return ""
+        try:
+            result = self.enrichment_service.run_liteparse_cli(
+                file_path=image_path,
+                dpi=settings.LITEPARSE_HIGH_QUALITY_DPI,
+                ocr_enabled=True,
+            )
+        except Exception:
+            return ""
+        texts: List[str] = []
+        if isinstance(result, dict):
+            for page_data in result.get("pages", []):
+                if not isinstance(page_data, dict):
+                    continue
+                txt = str(page_data.get("text") or "").strip()
+                if txt:
+                    texts.append(txt)
+            if not texts:
+                txt = str(result.get("text") or "").strip()
+                if txt:
+                    texts.append(txt)
+        return "\n".join(texts).strip()
+
+    def _extract_scanned_certificate_reference_evidence_vision(
+        self,
+        doc: fitz.Document,
+        page_number: int,
+    ) -> Dict[str, Any]:
+        if not settings.USE_SCANNED_CERT_VISION_EVIDENCE:
+            return {}
+        if not settings.LITEPARSE_OCR_ENABLED:
+            return {}
+        if not self.enrichment_service.cli_available:
+            return {}
+        if page_number <= 0 or page_number > len(doc):
+            return {}
+
+        page = doc.load_page(page_number - 1)
+        rect = page.rect
+        if rect.width <= 0 or rect.height <= 0:
+            return {}
+
+        scale = float(settings.LITEPARSE_HIGH_QUALITY_DPI) / 72.0
+        matrix = fitz.Matrix(scale, scale)
+        middle_clip = fitz.Rect(
+            rect.x0,
+            rect.y0 + (rect.height * 0.2),
+            rect.x1,
+            rect.y1 - (rect.height * 0.2),
+        )
+
+        tmp_full = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        tmp_mid = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        full_path = tmp_full.name
+        mid_path = tmp_mid.name
+        tmp_full.close()
+        tmp_mid.close()
+        try:
+            page.get_pixmap(matrix=matrix, alpha=False).save(full_path)
+            page.get_pixmap(matrix=matrix, clip=middle_clip, alpha=False).save(mid_path)
+            full_text = self._extract_text_with_liteparse_ocr_from_image(full_path)
+            mid_text = self._extract_text_with_liteparse_ocr_from_image(mid_path)
+        finally:
+            if os.path.exists(full_path):
+                os.remove(full_path)
+            if os.path.exists(mid_path):
+                os.remove(mid_path)
+
+        combined = "\n".join(part for part in [mid_text, full_text] if part).strip()
+        if not combined:
+            return {}
+
+        evidence = self._extract_scanned_certificate_reference_evidence(combined)
+        if not evidence:
+            return {}
+
+        evidence["evidence_source"] = "vision_image_regions"
+        evidence["supporting_phrases"] = self._collect_supporting_phrases(combined)
+        evidence["vision_regions"] = {
+            "full_text_len": len(full_text),
+            "middle_text_len": len(mid_text),
+            "used_regions": ["full_page", "middle_region"],
+        }
+        return evidence
+
+    def _merge_certificate_evidence(
+        self,
+        ocr_evidence: Dict[str, Any],
+        vision_evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        ocr = dict(ocr_evidence or {})
+        vis = dict(vision_evidence or {})
+        if not ocr and not vis:
+            return {}
+
+        def _pick_text(key: str) -> Optional[str]:
+            v = (vis.get(key) or "").strip() if isinstance(vis.get(key), str) else vis.get(key)
+            o = (ocr.get(key) or "").strip() if isinstance(ocr.get(key), str) else ocr.get(key)
+            if v:
+                return v
+            if o:
+                return o
+            return None
+
+        merged_phrases: List[str] = []
+        for src in (ocr, vis):
+            for phrase in src.get("supporting_phrases", []) or []:
+                phrase_norm = re.sub(r"\s+", " ", str(phrase)).strip()
+                if phrase_norm and phrase_norm not in merged_phrases:
+                    merged_phrases.append(phrase_norm)
+
+        ocr_conf = float(ocr.get("confidence", 0.0) or 0.0)
+        vis_conf = float(vis.get("confidence", 0.0) or 0.0)
+        confidence = max(ocr_conf, vis_conf)
+        if ocr and vis:
+            confidence = min(1.0, confidence + 0.1)
+
+        has_ocr = bool(ocr)
+        has_vis = bool(vis)
+        if has_ocr and has_vis:
+            source = "ocr_text_patterns+vision_image_regions"
+        elif has_vis:
+            source = vis.get("evidence_source") or "vision_image_regions"
+        else:
+            source = ocr.get("evidence_source") or "ocr_text_patterns"
+
+        return {
+            "is_certificate_reference": bool(ocr.get("is_certificate_reference") or vis.get("is_certificate_reference")),
+            "certificate_keyword_detected": bool(ocr.get("certificate_keyword_detected") or vis.get("certificate_keyword_detected")),
+            "primary_employment_confirmed": bool(ocr.get("primary_employment_confirmed") or vis.get("primary_employment_confirmed")),
+            "issuance_for_nrfu": bool(ocr.get("issuance_for_nrfu") or vis.get("issuance_for_nrfu")),
+            "person_name": _pick_text("person_name"),
+            "institution": _pick_text("institution"),
+            "position": _pick_text("position"),
+            "supporting_phrases": merged_phrases,
+            "primary_employment_phrase_detected": bool(ocr.get("primary_employment_phrase_detected") or vis.get("primary_employment_phrase_detected")),
+            "evidence_source": source,
+            "confidence": round(confidence, 3),
+        }
+
+    def _extract_scanned_certificate_reference_evidence(self, text: str) -> Dict[str, Any]:
+        src = re.sub(r"\s+", " ", text or "").strip()
+        if not src:
+            return {}
+
+        low = src.lower()
+        certificate_keyword_exact = bool(re.search(r"\bдовідк", low))
+        certificate_keyword_fuzzy = bool(re.search(r"(dovid|jlosink|jlosinka)", low))
+        certificate_keyword_detected = certificate_keyword_exact or certificate_keyword_fuzzy
+        has_main_employment = "за основним місцем роботи" in low
+        employment_fuzzy = bool(re.search(r"(прац|npai|prac)", low))
+        has_issued_phrase = ("довідка видана" in low) or ("видана" in low and "довідка" in low)
+        has_presentation_phrase = ("на пред'явлення" in low) or ("для подання" in low)
+        issuance_for_nrfu = (
+            ("національний фонд досліджень україни" in low)
+            or bool(re.search(r"\bnrfu\b", low, re.IGNORECASE))
+        )
+
+        institution = None
+        position = None
+        person_name = None
+
+        inst_match = re.search(r"(інститут[^,.]{0,80}|університет[^,.]{0,80}|академ[іїi][^,.]{0,80})", src, re.IGNORECASE)
+        if inst_match:
+            institution = inst_match.group(1).strip()
+        elif re.search(r"(ihcth|institut|instytut|hah|nan)", low):
+            institution = "institution_detected_from_ocr_fuzzy"
+
+        pos_match = re.search(r"(посада[:\s-]*[^,.]{3,80}|завідувач[^,.]{0,80}|директор[^,.]{0,80}|професор[^,.]{0,80})", src, re.IGNORECASE)
+        if pos_match:
+            position = pos_match.group(1).strip()
+
+        name_match = re.search(r"([А-ЯІЇЄҐ][а-яіїєґ']+\s+[А-ЯІЇЄҐ][а-яіїєґ']+\s+[А-ЯІЇЄҐ][а-яіїєґ']+)", src)
+        if name_match:
+            person_name = name_match.group(1).strip()
+
+        score = 0
+        if certificate_keyword_exact:
+            score += 2
+        elif certificate_keyword_fuzzy:
+            score += 1
+        if has_main_employment:
+            score += 2
+        elif employment_fuzzy:
+            score += 1
+        if has_issued_phrase:
+            score += 1
+        if has_presentation_phrase:
+            score += 1
+        if issuance_for_nrfu:
+            score += 1
+        if institution:
+            score += 1
+        if position:
+            score += 1
+
+        if score < 2 or not (certificate_keyword_detected or (has_main_employment and has_issued_phrase)):
+            return {}
+
+        primary_employment_confirmed = has_main_employment or (employment_fuzzy and bool(institution))
+
+        return {
+            "is_certificate_reference": True,
+            "primary_employment_confirmed": primary_employment_confirmed,
+            "issuance_for_nrfu": issuance_for_nrfu,
+            "certificate_keyword_detected": certificate_keyword_detected,
+            "primary_employment_phrase_detected": has_main_employment,
+            "person_name": person_name,
+            "institution": institution,
+            "position": position,
+            "has_main_employment_phrase": has_main_employment,
+            "has_issued_phrase": has_issued_phrase,
+            "has_presentation_phrase": has_presentation_phrase,
+            "supporting_phrases": self._collect_supporting_phrases(src),
+            "evidence_source": "ocr_text_patterns",
+            "confidence": round(min(1.0, score / 7.0), 3),
+        }
+
+    def _classify_scanned_page_family(
+        self,
+        page_index: int,
+        pages_text: List[str],
+        word_count: int,
+        digit_ratio: float,
+    ) -> Tuple[str, float, Dict[str, Any]]:
+        text = pages_text[page_index] if 0 <= page_index < len(pages_text) else ""
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in (text or "").splitlines() if ln and ln.strip()]
+        low = (text or "").lower()
+        line_count = len(lines)
+        text_density = (word_count / max(line_count, 1)) if line_count else float(word_count)
+
+        cert_cues = [
+            "працює",
+            "за основним місцем роботи",
+            "довідка видана",
+            "на пред'явлення",
+            "видана для подання",
+            "місце роботи",
+            "посада",
+            "інститут",
+            "національний фонд досліджень україни",
+        ]
+        table_cues = [
+            "обсяг фінансування",
+            "економічне обґрунтування",
+            "найменування",
+            "статті витрат",
+            "етап виконання проєкту",
+            "у випадку залучення",
+            "сума",
+            "грн",
+            "№ з/п",
+            "критер",
+        ]
+
+        cert_hits = sum(1 for cue in cert_cues if cue in low)
+        table_hits = sum(1 for cue in table_cues if cue in low)
+        cert_ev = self._extract_scanned_certificate_reference_evidence(text)
+        certificate_keyword_detected = bool(cert_ev.get("certificate_keyword_detected")) or bool(re.search(r"\bдовідк", low))
+        primary_employment_phrase_detected = bool(cert_ev.get("primary_employment_phrase_detected")) or ("за основним місцем роботи" in low)
+        issuance_for_nrfu = bool(cert_ev.get("issuance_for_nrfu")) or (
+            ("національний фонд досліджень україни" in low)
+            or bool(re.search(r"\bnrfu\b", low, re.IGNORECASE))
+        )
+        heading_like_hits = sum(
+            1
+            for ln in lines[:8]
+            if re.search(r"(^\d+\)|етап|статтею|обґрунтування|критер)", ln, re.IGNORECASE)
+        )
+
+        neighbor_table_continuity = 0
+        for n_idx in (page_index - 1, page_index + 1):
+            if n_idx < 0 or n_idx >= len(pages_text):
+                continue
+            n_low = (pages_text[n_idx] or "").lower()
+            if not n_low:
+                continue
+            n_table_hits = sum(1 for cue in table_cues if cue in n_low)
+            if n_table_hits >= 1 and (digit_ratio > 0.05 or sum(ch.isdigit() for ch in n_low) / max(len(n_low), 1) > 0.05):
+                neighbor_table_continuity += 1
+
+        certificate_score = 0.0
+        if certificate_keyword_detected and primary_employment_phrase_detected:
+            certificate_score += 0.75
+        elif certificate_keyword_detected:
+            certificate_score += 0.35
+        elif primary_employment_phrase_detected:
+            certificate_score += 0.35
+        if cert_hits >= 2:
+            certificate_score += 0.1
+        if "працює" in low and primary_employment_phrase_detected:
+            certificate_score += 0.25
+        if ("довідка" in low and "видана" in low) or "на пред'явлення" in low:
+            certificate_score += 0.2
+        if issuance_for_nrfu:
+            certificate_score += 0.1
+        if cert_ev:
+            certificate_score += min(0.2, float(cert_ev.get("confidence", 0.0)) * 0.25)
+        if table_hits >= 2:
+            certificate_score -= 0.2
+
+        table_score = 0.0
+        if table_hits >= 2:
+            table_score += 0.35
+        if heading_like_hits >= 1:
+            table_score += 0.15
+        if digit_ratio >= 0.08:
+            table_score += 0.15
+        if line_count >= 6:
+            table_score += 0.1
+        if text_density <= 9:
+            table_score += 0.1
+        if neighbor_table_continuity >= 1:
+            table_score += 0.15
+
+        certificate_score = max(0.0, min(1.0, certificate_score))
+        table_score = max(0.0, min(1.0, table_score))
+
+        if certificate_score >= 0.55 and certificate_score >= (table_score + 0.1):
+            family = "certificate_reference_evidence"
+            confidence = certificate_score
+        elif table_score >= 0.55:
+            family = "multi_page_table_family"
+            confidence = table_score
+        else:
+            family = "scanned_supporting_misc"
+            confidence = max(0.5, 1.0 - max(table_score, certificate_score))
+
+        return family, confidence, {
+            "line_count": line_count,
+            "text_density": round(text_density, 3),
+            "digit_ratio": round(digit_ratio, 4),
+            "certificate_cue_hits": cert_hits,
+            "table_cue_hits": table_hits,
+            "certificate_keyword_detected": certificate_keyword_detected,
+            "primary_employment_phrase_detected": primary_employment_phrase_detected,
+            "issuance_for_nrfu": issuance_for_nrfu,
+            "certificate_evidence_confidence": cert_ev.get("confidence") if cert_ev else 0.0,
+            "heading_like_hits": heading_like_hits,
+            "neighbor_table_continuity": neighbor_table_continuity,
+            "certificate_score": round(certificate_score, 3),
+            "table_score": round(table_score, 3),
+        }
+
+    def _build_line_layout_rows(self, raw_text: str) -> Tuple[List[CanonicalTableColumn], List[CanonicalTableRow], List[str]]:
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in (raw_text or "").splitlines() if ln and ln.strip()]
+        warnings: List[str] = []
+        if not lines:
+            warnings.append("no_text_from_liteparse")
+
+        rows: List[CanonicalTableRow] = []
+        for idx, line in enumerate(lines):
+            rows.append(
+                CanonicalTableRow(
+                    row_id=f"r{idx}",
+                    cells=[
+                        CanonicalTableCell(col_id="c0", text=str(idx + 1), normalized=idx + 1),
+                        CanonicalTableCell(col_id="c1", text=line, normalized=line),
+                    ],
+                )
+            )
+
+        columns = [
+            CanonicalTableColumn(col_id="c0", name="line_number", semantic_type="int"),
+            CanonicalTableColumn(col_id="c1", name="ocr_text", semantic_type="string"),
+        ]
+        return columns, rows, warnings
+
+    def _build_light_table_from_text_items(
+        self,
+        page_data: Dict[str, Any],
+        min_y: Optional[float] = None,
+    ) -> Tuple[bool, List[CanonicalTableColumn], List[CanonicalTableRow], List[int], List[str]]:
+        items_raw = page_data.get("textItems") or []
+        if not isinstance(items_raw, list) or not items_raw:
+            return False, [], [], [], ["no_text_items"]
+
+        token_items = []
+        heights: List[float] = []
+        for item in items_raw:
+            if not isinstance(item, dict):
+                continue
+            text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+            if not text:
+                continue
+            x = float(item.get("x") or 0.0)
+            y = float(item.get("y") or 0.0)
+            w = float(item.get("width") or 0.0)
+            h = float(item.get("height") or 0.0)
+            if min_y is not None and y < (min_y - 2.0):
+                continue
+            token_items.append({"text": text, "x": x, "y": y, "w": w, "h": h})
+            if h > 0:
+                heights.append(h)
+
+        if len(token_items) < 6:
+            return False, [], [], [], ["insufficient_text_items"]
+
+        token_items.sort(key=lambda t: (t["y"], t["x"]))
+        avg_h = (sum(heights) / len(heights)) if heights else 8.0
+        row_tol = max(4.0, min(14.0, avg_h * 0.8))
+        col_gap = max(16.0, min(60.0, avg_h * 2.2))
+
+        row_groups: List[Dict[str, Any]] = []
+        for tok in token_items:
+            if not row_groups:
+                row_groups.append({"y": tok["y"], "items": [tok]})
+                continue
+            if abs(tok["y"] - row_groups[-1]["y"]) <= row_tol:
+                row_groups[-1]["items"].append(tok)
+                row_groups[-1]["y"] = (row_groups[-1]["y"] + tok["y"]) / 2.0
+            else:
+                row_groups.append({"y": tok["y"], "items": [tok]})
+
+        if len(row_groups) < 3:
+            return False, [], [], [], ["insufficient_row_groups"]
+
+        row_cells_text: List[List[str]] = []
+        for group in row_groups:
+            toks = sorted(group["items"], key=lambda t: t["x"])
+            if not toks:
+                continue
+            current_chunks: List[str] = [toks[0]["text"]]
+            prev_right = toks[0]["x"] + toks[0]["w"]
+            row_cells: List[str] = []
+            for tok in toks[1:]:
+                gap = tok["x"] - prev_right
+                if gap > col_gap:
+                    row_cells.append(re.sub(r"\s+", " ", " ".join(current_chunks)).strip())
+                    current_chunks = [tok["text"]]
+                else:
+                    current_chunks.append(tok["text"])
+                prev_right = max(prev_right, tok["x"] + tok["w"])
+            if current_chunks:
+                row_cells.append(re.sub(r"\s+", " ", " ".join(current_chunks)).strip())
+            row_cells = [c for c in row_cells if c]
+            if row_cells:
+                row_cells_text.append(row_cells)
+
+        if not row_cells_text:
+            return False, [], [], [], ["no_row_cells"]
+
+        max_cols = max(len(r) for r in row_cells_text)
+        multi_col_rows = sum(1 for r in row_cells_text if len(r) >= 2)
+        if max_cols < 2 or multi_col_rows < max(2, int(len(row_cells_text) * 0.25)):
+            return False, [], [], [], ["weak_cell_grouping"]
+        row_cells_text, repair_warnings = self._repair_questionnaire_row_number_drift(row_cells_text, max_cols)
+
+        columns = [
+            CanonicalTableColumn(col_id=f"c{i}", name=f"col_{i + 1}", semantic_type="string")
+            for i in range(max_cols)
+        ]
+
+        def _normalize_cell(text: str) -> Any:
+            clean = text.strip()
+            if re.fullmatch(r"[\d\s,\.]+", clean):
+                digits = re.sub(r"[^\d]", "", clean)
+                if digits:
+                    try:
+                        return int(digits)
+                    except ValueError:
+                        return clean
+            return clean
+
+        rows: List[CanonicalTableRow] = []
+        header_rows: List[int] = []
+        for idx, cells in enumerate(row_cells_text):
+            row_cells: List[CanonicalTableCell] = []
+            digit_cells = 0
+            for c_idx in range(max_cols):
+                text_val = cells[c_idx] if c_idx < len(cells) else ""
+                if re.search(r"\d", text_val):
+                    digit_cells += 1
+                row_cells.append(
+                    CanonicalTableCell(
+                        col_id=f"c{c_idx}",
+                        text=text_val,
+                        normalized=_normalize_cell(text_val) if text_val else "",
+                    )
+                )
+            if idx < 2 and digit_cells == 0:
+                header_rows.append(idx)
+            rows.append(CanonicalTableRow(row_id=f"r{idx}", cells=row_cells))
+
+        return True, columns, rows, header_rows, repair_warnings
+
+    def _repair_questionnaire_row_number_drift(
+        self,
+        row_cells_text: List[List[str]],
+        max_cols: int,
+    ) -> Tuple[List[List[str]], List[str]]:
+        """
+        Conservative repair for questionnaire-like tables where first-column row numbers
+        drift to the end of the previous row's last cell (e.g., "... текст 10").
+        """
+        if max_cols < 4 or len(row_cells_text) < 4:
+            return row_cells_text, []
+
+        number_re = re.compile(r"^\d{1,2}$")
+        leading_number_count = sum(
+            1 for row in row_cells_text if row and number_re.fullmatch((row[0] or "").strip())
+        )
+        if leading_number_count < 3:
+            return row_cells_text, []
+
+        repaired = [list(r) for r in row_cells_text]
+        warnings: List[str] = []
+        last_seen_num: Optional[int] = None
+
+        for idx, row in enumerate(repaired):
+            if row and number_re.fullmatch((row[0] or "").strip()):
+                try:
+                    last_seen_num = int(row[0].strip())
+                except ValueError:
+                    last_seen_num = None
+                continue
+            if idx == 0 or last_seen_num is None:
+                continue
+
+            prev = repaired[idx - 1]
+            if not prev:
+                continue
+            tail = (prev[-1] or "").strip()
+            m = re.search(r"(?:^|\s)(\d{1,2})\s*$", tail)
+            if not m:
+                continue
+
+            candidate = m.group(1)
+            try:
+                candidate_num = int(candidate)
+            except ValueError:
+                continue
+            if candidate_num != (last_seen_num + 1):
+                continue
+
+            prev_tail_clean = tail[: m.start(1)].strip()
+            prev[-1] = prev_tail_clean
+            repaired[idx] = [candidate] + row
+            if len(repaired[idx]) > max_cols:
+                overflow = repaired[idx][max_cols - 1 :]
+                repaired[idx] = repaired[idx][: max_cols - 1] + [" ".join([c for c in overflow if c]).strip()]
+            warnings.append("questionnaire_row_number_repaired")
+            last_seen_num = candidate_num
+
+        if not warnings:
+            return row_cells_text, []
+        return repaired, sorted(set(warnings))
+
+    def _apply_scanned_semantic_column_mapping(
+        self,
+        columns: List[CanonicalTableColumn],
+        rows: List[CanonicalTableRow],
+        header_rows: List[int],
+    ) -> Tuple[List[CanonicalTableColumn], Dict[str, Any], List[str]]:
+        warnings: List[str] = []
+        mapping_meta: Dict[str, Any] = {
+            "applied": False,
+            "confidence": 0.0,
+            "header_row_index": None,
+            "mapped_columns": {},
+        }
+
+        if not columns or not rows or not header_rows:
+            warnings.append("semantic_mapping_weak_no_header")
+            return columns, mapping_meta, warnings
+
+        header_idx = next((idx for idx in header_rows if 0 <= idx < len(rows)), None)
+        if header_idx is None:
+            warnings.append("semantic_mapping_weak_no_valid_header")
+            return columns, mapping_meta, warnings
+
+        header_cells = rows[header_idx].cells
+        if not header_cells:
+            warnings.append("semantic_mapping_weak_empty_header")
+            return columns, mapping_meta, warnings
+
+        def _semantic_name(text: str, fallback_idx: int) -> str:
+            low = (text or "").lower()
+            low = re.sub(r"\s+", " ", low).strip()
+            if not low:
+                return f"col_{fallback_idx + 1}"
+            if re.search(r"\bдата\b|\bdate\b", low):
+                return "date"
+            if re.search(r"номер|№|no\\.?|id|код", low):
+                return "identifier"
+            if re.search(r"назва|заява|довідка|title|document", low):
+                return "document_title"
+            if re.search(r"установа|інститут|організац|institution|organization", low):
+                return "institution"
+            if re.search(r"email|e-mail|телефон|phone|контакт", low):
+                return "contact"
+            if re.search(r"адрес", low):
+                return "address"
+            if re.search(r"статус|відповідн|status", low):
+                return "status"
+            if re.search(r"приміт|коментар|note", low):
+                return "note"
+            return f"col_{fallback_idx + 1}"
+
+        mapped: Dict[str, str] = {}
+        mapped_count = 0
+        non_empty_count = 0
+        for idx, col in enumerate(columns):
+            cell_text = header_cells[idx].text if idx < len(header_cells) else ""
+            if cell_text.strip():
+                non_empty_count += 1
+            semantic = _semantic_name(cell_text, idx)
+            mapped[col.col_id] = semantic
+            if semantic != f"col_{idx + 1}":
+                mapped_count += 1
+
+        confidence = (mapped_count / max(non_empty_count, 1)) if non_empty_count else 0.0
+        mapping_meta["confidence"] = round(confidence, 3)
+        mapping_meta["header_row_index"] = header_idx
+        mapping_meta["mapped_columns"] = mapped
+
+        if mapped_count >= 2 and confidence >= 0.5:
+            renamed_columns = [
+                CanonicalTableColumn(col_id=col.col_id, name=mapped.get(col.col_id, col.name), semantic_type=col.semantic_type)
+                for col in columns
+            ]
+            mapping_meta["applied"] = True
+            return renamed_columns, mapping_meta, warnings
+
+        warnings.append("semantic_mapping_weak")
+        return columns, mapping_meta, warnings
+
+    def _extract_scanned_financial_context(
+        self,
+        text: str,
+        prev_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Optional[str]], int, Dict[str, bool]]:
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in (text or "").splitlines()]
+        lines = [ln for ln in lines if ln]
+        context: Dict[str, Optional[str]] = {
+            "subsubsection_title": None,
+            "subsection_anchor": None,
+            "stage_label": None,
+            "case_label": None,
+        }
+        detected = {
+            "subsubsection_title": False,
+            "subsection_anchor": False,
+            "stage_label": False,
+            "case_label": False,
+        }
+        context_start_idx = 0
+        if not lines:
+            return context, context_start_idx, detected
+
+        numbered_sub_pat = re.compile(r"^\s*((?:\d+\.){2,}\d+)\s+(.+)$", re.IGNORECASE)
+        unnumbered_sub_pat = re.compile(r"(економічне\s+обґрунтування\s+витрат\s+за\s+статтею)", re.IGNORECASE)
+        stage_pat = re.compile(r"^\s*\d+\)\s*.+етап.+проєкту", re.IGNORECASE)
+        case_pat = re.compile(r"у\s+випадку", re.IGNORECASE)
+
+        for idx, line in enumerate(lines[:20]):
+            numbered_match = numbered_sub_pat.match(line)
+            if context["subsubsection_title"] is None and numbered_match:
+                context["subsection_anchor"] = numbered_match.group(1).strip()
+                context["subsubsection_title"] = line
+                detected["subsection_anchor"] = True
+                detected["subsubsection_title"] = True
+                context_start_idx = idx
+                continue
+            if context["subsubsection_title"] is None and unnumbered_sub_pat.search(line):
+                context["subsubsection_title"] = line
+                detected["subsubsection_title"] = True
+                context_start_idx = idx
+                continue
+            if context["stage_label"] is None and stage_pat.search(line):
+                context["stage_label"] = line
+                detected["stage_label"] = True
+                if context["subsubsection_title"] is None:
+                    context_start_idx = idx
+                continue
+            if context["case_label"] is None and case_pat.search(line):
+                context["case_label"] = line
+                detected["case_label"] = True
+                if context["subsubsection_title"] is None and context["stage_label"] is None:
+                    context_start_idx = idx
+
+        if prev_context:
+            for key in ("subsubsection_title", "subsection_anchor", "stage_label", "case_label"):
+                if not context.get(key) and prev_context.get(key):
+                    context[key] = prev_context.get(key)
+
+        return context, context_start_idx, detected
+
+    def _context_start_y_from_text_items(
+        self,
+        page_data: Dict[str, Any],
+        context: Dict[str, Optional[str]],
+    ) -> Optional[float]:
+        items = page_data.get("textItems") or []
+        if not isinstance(items, list) or not items:
+            return None
+
+        anchors: List[str] = []
+        for key in ("subsubsection_title", "stage_label", "case_label"):
+            val = (context.get(key) or "").strip()
+            if val:
+                anchors.append(val)
+
+        if not anchors:
+            return None
+
+        def _norm(t: str) -> str:
+            return re.sub(r"\s+", " ", t or "").strip().lower()
+
+        item_hits: List[float] = []
+        norm_anchors = [_norm(a) for a in anchors]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            t = _norm(str(item.get("text") or ""))
+            if not t:
+                continue
+            for anc in norm_anchors:
+                probe = anc[:32]
+                if probe and (probe in t or t in anc):
+                    y = float(item.get("y") or 0.0)
+                    item_hits.append(y)
+                    break
+        return min(item_hits) if item_hits else None
+
+    def _trim_text_to_financial_context(
+        self,
+        raw_text: str,
+        start_idx: int,
+    ) -> str:
+        lines = [ln for ln in (raw_text or "").splitlines()]
+        if not lines:
+            return raw_text or ""
+        if 0 <= start_idx < len(lines):
+            return "\n".join(lines[start_idx:])
+        return raw_text or ""
+
+    def _is_financial_detail_candidate_page(
+        self,
+        page_number: int,
+        pages_text: List[str],
+    ) -> bool:
+        patterns = [
+            r"3\.6\.\d+",
+            r"економічне\s+обґрунтування\s+витрат",
+            r"етап\s+виконання\s+проєкту",
+            r"у\s+випадку\s+залучення",
+            r"оплата\s+праці",
+        ]
+        idx = page_number - 1
+        windows = [idx - 1, idx, idx + 1]
+        for w in windows:
+            if w < 0 or w >= len(pages_text):
+                continue
+            text = pages_text[w] or ""
+            for pat in patterns:
+                if re.search(pat, text, re.IGNORECASE):
+                    return True
+        return False
+
+    def _prepare_liteparse_pdf_with_orientation_normalization(
+        self,
+        file_content: bytes,
+        target_pages: List[int],
+    ) -> Tuple[str, Dict[int, Dict[str, Any]]]:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+        orientation_meta: Dict[int, Dict[str, Any]] = {}
+        for p in target_pages:
+            if p <= 0 or p > doc.page_count:
+                continue
+            page = doc.load_page(p - 1)
+            rect = page.rect
+            is_landscape = rect.width > rect.height
+            original_rotation = int(page.rotation or 0)
+            applied_rotation = 0
+            if is_landscape:
+                new_rotation = (original_rotation + 90) % 360
+                page.set_rotation(new_rotation)
+                applied_rotation = 90
+            orientation_meta[p] = {
+                "is_landscape": is_landscape,
+                "original_rotation": original_rotation,
+                "applied_rotation": applied_rotation,
+                "width": round(rect.width, 2),
+                "height": round(rect.height, 2),
+            }
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp_path = tmp.name
+        tmp.close()
+        doc.save(tmp_path)
+        doc.close()
+        return tmp_path, orientation_meta
+
+    def _suppress_routed_financial_detail_paragraphs(
+        self,
+        structure: ParsedDocumentStructure,
+        page_numbers: Set[int],
+    ) -> None:
+        if not page_numbers:
+            return
+
+        def _clean_section(sec: DocumentSection):
+            sec.blocks = [
+                b for b in sec.blocks
+                if not (b.block_type == "paragraph" and b.page_number in page_numbers)
+            ]
+            for sub in sec.subsections:
+                _clean_section(sub)
+
+        for zone in structure.zones:
+            if zone.zone_type != "description":
+                continue
+            zone.blocks = [
+                b for b in zone.blocks
+                if not (b.block_type == "paragraph" and b.page_number in page_numbers)
+            ]
+            for sec in zone.sections:
+                _clean_section(sec)
+
+    def _is_native_financial_detail_candidate_page(
+        self,
+        page_number: int,
+        pages_text: List[str],
+    ) -> bool:
+        patterns = [
+            r"обсяг\s+фінансування\s+за\s+окремими\s+статтями\s+витрат",
+            r"економічне\s+обґрунтування\s+витрат\s+за\s+статтею",
+            r"оплата\s+праці",
+            r"матеріал(и|ів|и)?",
+            r"обладнан(ня|ням)",
+            r"непрям(і|их)\s+витрат",
+            r"інші\s+витрат(и|)\b",
+            r"етап\s+виконання\s+проєкту",
+            r"у\s+випадку\s+залучення",
+        ]
+        idx = page_number - 1
+        windows = [idx - 1, idx, idx + 1]
+        for w in windows:
+            if w < 0 or w >= len(pages_text):
+                continue
+            text = pages_text[w] or ""
+            for pat in patterns:
+                if re.search(pat, text, re.IGNORECASE):
+                    return True
+        return False
+
+    def _extract_native_financial_detail_context(
+        self,
+        text: str,
+        prev_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Optional[str]], int, Dict[str, bool]]:
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in (text or "").splitlines()]
+        lines = [ln for ln in lines if ln]
+        context: Dict[str, Optional[str]] = {
+            "table_title": None,
+            "subsubsection_title": None,
+            "subsection_anchor": None,
+            "stage_label": None,
+            "case_label": None,
+        }
+        detected = {
+            "table_title": False,
+            "subsubsection_title": False,
+            "subsection_anchor": False,
+            "stage_label": False,
+            "case_label": False,
+        }
+        context_start_idx = 0
+        if not lines:
+            return context, context_start_idx, detected
+
+        numbered_sub_pat = re.compile(r"^\s*((?:\d+\.){2,}\d+)\s+(.+)$", re.IGNORECASE)
+        title_pat = re.compile(
+            r"(обсяг\s+фінансування\s+за\s+окремими\s+статтями\s+витрат|економічне\s+обґрунтування\s+витрат\s+за\s+статтею)",
+            re.IGNORECASE,
+        )
+        stage_pat = re.compile(r"^\s*\d+\)\s*.+етап.+проєкту", re.IGNORECASE)
+        case_pat = re.compile(r"у\s+випадку", re.IGNORECASE)
+
+        for idx, line in enumerate(lines[:28]):
+            numbered_match = numbered_sub_pat.match(line)
+            if context["subsubsection_title"] is None and numbered_match:
+                title_tail = numbered_match.group(2).strip()
+                if title_pat.search(title_tail):
+                    context["subsection_anchor"] = numbered_match.group(1).strip()
+                    context["subsubsection_title"] = line
+                    context["table_title"] = title_tail
+                    detected["subsection_anchor"] = True
+                    detected["subsubsection_title"] = True
+                    detected["table_title"] = True
+                    context_start_idx = idx
+                    continue
+
+            if context["table_title"] is None and title_pat.search(line):
+                context["table_title"] = line
+                context["subsubsection_title"] = line
+                detected["table_title"] = True
+                detected["subsubsection_title"] = True
+                context_start_idx = idx
+                continue
+
+            if context["stage_label"] is None and stage_pat.search(line):
+                context["stage_label"] = line
+                detected["stage_label"] = True
+                if context["table_title"] is None:
+                    context_start_idx = idx
+                continue
+
+            if context["case_label"] is None and case_pat.search(line):
+                context["case_label"] = line
+                detected["case_label"] = True
+                if context["table_title"] is None and context["stage_label"] is None:
+                    context_start_idx = idx
+
+        if prev_context:
+            for key in ("table_title", "subsubsection_title", "subsection_anchor", "stage_label", "case_label"):
+                if not context.get(key) and prev_context.get(key):
+                    context[key] = prev_context.get(key)
+
+        return context, context_start_idx, detected
+
+    def _build_light_table_from_native_lines(
+        self,
+        raw_text: str,
+    ) -> Tuple[bool, List[CanonicalTableColumn], List[CanonicalTableRow], List[int], List[str]]:
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in (raw_text or "").splitlines() if ln and ln.strip()]
+        if len(lines) < 4:
+            return False, [], [], [], ["insufficient_lines"]
+
+        parsed_rows: List[List[str]] = []
+        multi_col_rows = 0
+        for line in lines:
+            if "\t" in line:
+                cells = [c.strip() for c in line.split("\t") if c and c.strip()]
+            else:
+                cells = [c.strip() for c in re.split(r"\s{2,}", line) if c and c.strip()]
+                if len(cells) <= 1:
+                    cells = [c.strip() for c in re.split(r"\s+\|\s+", line) if c and c.strip()]
+            if not cells:
+                continue
+            parsed_rows.append(cells)
+            if len(cells) >= 2:
+                multi_col_rows += 1
+
+        if len(parsed_rows) < 3:
+            return False, [], [], [], ["insufficient_parsed_rows"]
+
+        max_cols = max(len(r) for r in parsed_rows)
+        if max_cols < 2 or multi_col_rows < 2:
+            return False, [], [], [], ["weak_native_cell_grouping"]
+        parsed_rows, repair_warnings = self._repair_questionnaire_row_number_drift(parsed_rows, max_cols)
+
+        columns = [
+            CanonicalTableColumn(col_id=f"c{i}", name=f"col_{i + 1}", semantic_type="string")
+            for i in range(max_cols)
+        ]
+
+        def _normalize_cell(text: str) -> Any:
+            clean = text.strip()
+            if re.fullmatch(r"[\d\s,\.]+", clean):
+                digits = re.sub(r"[^\d]", "", clean)
+                if digits:
+                    try:
+                        return int(digits)
+                    except ValueError:
+                        return clean
+            return clean
+
+        rows: List[CanonicalTableRow] = []
+        header_rows: List[int] = []
+        for idx, cells in enumerate(parsed_rows):
+            digit_cells = 0
+            row_cells: List[CanonicalTableCell] = []
+            for c_idx in range(max_cols):
+                text_val = cells[c_idx] if c_idx < len(cells) else ""
+                if re.search(r"\d", text_val):
+                    digit_cells += 1
+                row_cells.append(
+                    CanonicalTableCell(
+                        col_id=f"c{c_idx}",
+                        text=text_val,
+                        normalized=_normalize_cell(text_val) if text_val else "",
+                    )
+                )
+            if idx < 2 and digit_cells == 0:
+                header_rows.append(idx)
+            rows.append(CanonicalTableRow(row_id=f"r{idx}", cells=row_cells))
+
+        return True, columns, rows, header_rows, repair_warnings
+
+    def _augment_native_complex_description_tables(
+        self,
+        structure: ParsedDocumentStructure,
+        pages_text: List[str],
+    ) -> None:
+        native_specs: List[int] = []
+        for cls in structure.page_table_classifications:
+            if cls.page_class != "native_text_complex_table":
+                continue
+            zone = next(
+                (z for z in structure.zones if z.page_start <= cls.page_number <= (z.page_end or z.page_start)),
+                None,
+            )
+            if not zone or zone.zone_type != "description":
+                continue
+            if self._is_native_financial_detail_candidate_page(cls.page_number, pages_text):
+                native_specs.append(cls.page_number)
+
+        prev_ctx: Dict[str, Optional[str]] = {}
+        prev_page: Optional[int] = None
+        continuation_group: Optional[str] = None
+        routed_pages: Set[int] = set()
+        table_family = "native_financial_detail_complex_table"
+        emitted_native_by_page: Dict[int, CanonicalTable] = {}
+
+        for page_num in sorted(set(native_specs)):
+            if page_num <= 0 or page_num > len(pages_text):
+                continue
+            raw_text = pages_text[page_num - 1] or ""
+            if not raw_text.strip():
+                continue
+
+            prev_ctx_snapshot = prev_ctx.copy()
+            context, context_start_idx, detected_ctx = self._extract_native_financial_detail_context(raw_text, prev_ctx)
+            trimmed_text = self._trim_text_to_financial_context(raw_text, context_start_idx)
+            grouped, columns, rows, header_rows, grouping_warnings = self._build_light_table_from_native_lines(trimmed_text)
+            fallback_warnings: List[str] = []
+            semantic_warnings: List[str] = []
+            semantic_meta: Dict[str, Any] = {
+                "applied": False,
+                "confidence": 0.0,
+                "header_row_index": None,
+                "mapped_columns": {},
+            }
+            if not grouped:
+                columns, rows, fallback_warnings = self._build_line_layout_rows(trimmed_text)
+            else:
+                columns, semantic_meta, semantic_warnings = self._apply_scanned_semantic_column_mapping(columns, rows, header_rows)
+            warnings = grouping_warnings + semantic_warnings + fallback_warnings
+            extraction_mode = "native_financial_detail_light_table" if grouped else "native_financial_detail_line_fallback"
+
+            cls = next((c for c in structure.page_table_classifications if c.page_number == page_num), None)
+            page_class = cls.page_class if cls else "native_text_complex_table"
+            page_confidence = cls.confidence if cls else 0.8
+
+            has_fresh_context = any(detected_ctx.get(k, False) for k in ("table_title", "subsubsection_title", "stage_label", "case_label"))
+            continuation = False
+            if prev_page is not None and page_num == (prev_page + 1):
+                same_context = (
+                    context.get("table_title") == prev_ctx_snapshot.get("table_title")
+                    and context.get("stage_label") == prev_ctx_snapshot.get("stage_label")
+                    and context.get("case_label") == prev_ctx_snapshot.get("case_label")
+                )
+                if same_context or not has_fresh_context:
+                    continuation = True
+
+            if continuation and continuation_group:
+                group_id = continuation_group
+            else:
+                group_id = f"native_fin_detail_grp_p{page_num:03d}"
+                continuation_group = group_id
+
+            table_title = (
+                context.get("table_title")
+                or context.get("subsubsection_title")
+                or context.get("stage_label")
+                or "Native financial detail table"
+            )
+
+            routed_pages.add(page_num)
+            prev_page = page_num
+            prev_ctx = context.copy()
+
+            native_table = CanonicalTable(
+                table_id=f"tbl_{table_family}_p{page_num:03d}_01",
+                table_family=table_family,
+                zone_type="description",
+                title=table_title,
+                page_start=page_num,
+                page_end=page_num,
+                source={
+                    "parser": "pymupdf_native",
+                    "page_class": page_class,
+                    "confidence": page_confidence,
+                    "extraction_mode": extraction_mode,
+                    "semantic_mapping_confidence": semantic_meta.get("confidence", 0.0),
+                    "warnings": warnings,
+                },
+                context={
+                    "table_title": context.get("table_title"),
+                    "subsubsection_title": context.get("subsubsection_title"),
+                    "subsection_anchor": context.get("subsection_anchor"),
+                    "stage_label": context.get("stage_label"),
+                    "case_label": context.get("case_label"),
+                    "table_group_id": group_id,
+                    "continuation": continuation,
+                },
+                columns=columns,
+                rows=rows,
+                spans=[],
+                validation={
+                    "row_count": len(rows),
+                    "column_count": len(columns),
+                    "header_row_indices": header_rows,
+                    "semantic_mapping": semantic_meta,
+                    "normalization_warnings": warnings,
+                },
+            )
+
+            structure.tables = [
+                t for t in structure.tables
+                if not (
+                    t.table_family == table_family
+                    and t.page_start == page_num
+                )
+            ]
+            structure.tables.append(native_table)
+            emitted_native_by_page[page_num] = native_table
+
+        scanned_cont_pages: Set[int] = set()
+        if True:
+            class_by_page: Dict[int, TablePageClassification] = {
+                c.page_number: c for c in structure.page_table_classifications
+            }
+            def _is_generic_native_table_candidate(page_num: int) -> bool:
+                if page_num <= 0 or page_num > len(pages_text):
+                    return False
+                text = (pages_text[page_num - 1] or "")
+                low = text.lower()
+                if re.search(r"(анкета\s+відповідності|критер|наукового\s+керівника)", low):
+                    return True
+                lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln and ln.strip()]
+                numeric_lead = sum(1 for ln in lines if re.match(r"^\d{1,2}\b", ln))
+                return numeric_lead >= 5
+
+            def _extract_family_label(page_num: int) -> Optional[str]:
+                if page_num <= 0 or page_num > len(pages_text):
+                    return None
+                lines = [re.sub(r"\s+", " ", ln).strip() for ln in (pages_text[page_num - 1] or "").splitlines() if ln and ln.strip()]
+                for ln in lines[:12]:
+                    if len(ln) < 8:
+                        continue
+                    if re.search(r"(анкета|критер|відповідності)", ln.lower()):
+                        return ln
+                return lines[0] if lines else None
+
+            def _has_tabular_density(page_num: int) -> bool:
+                if page_num <= 0 or page_num > len(pages_text):
+                    return False
+                lines = [re.sub(r"\s+", " ", ln).strip() for ln in (pages_text[page_num - 1] or "").splitlines() if ln and ln.strip()]
+                if len(lines) < 8:
+                    return False
+                numeric_lead = sum(1 for ln in lines if re.match(r"^\d{1,2}\b", ln))
+                digit_heavy = sum(1 for ln in lines if sum(ch.isdigit() for ch in ln) >= 2)
+                return (numeric_lead >= 2) or (digit_heavy >= max(3, int(len(lines) * 0.25)))
+
+            native_terminal_groups: List[Dict[str, Any]] = []
+            native_desc_pages = sorted(
+                c.page_number for c in structure.page_table_classifications
+                if c.page_class in {"native_text", "native_text_complex_table"}
+                and any(
+                    z.zone_type == "description" and z.page_start <= c.page_number <= (z.page_end or z.page_start)
+                    for z in structure.zones
+                )
+            )
+            if native_desc_pages:
+                run: List[int] = []
+                for p in native_desc_pages:
+                    is_seed_candidate = _is_generic_native_table_candidate(p)
+                    is_continuation_candidate = _has_tabular_density(p)
+                    if run and p == run[-1] + 1 and (is_seed_candidate or is_continuation_candidate):
+                        run.append(p)
+                        continue
+                    if is_seed_candidate:
+                        if not run:
+                            run = [p]
+                        else:
+                            if len(run) >= 3:
+                                native_terminal_groups.append({
+                                    "start": run[0],
+                                    "end": run[-1],
+                                    "label": _extract_family_label(run[0]),
+                                })
+                            run = [p]
+                    else:
+                        if len(run) >= 3:
+                            native_terminal_groups.append({
+                                "start": run[0],
+                                "end": run[-1],
+                                "label": _extract_family_label(run[0]),
+                            })
+                        run = []
+                if len(run) >= 3:
+                    native_terminal_groups.append({
+                        "start": run[0],
+                        "end": run[-1],
+                        "label": _extract_family_label(run[0]),
+                    })
+
+            def _set_page_decision(
+                page_num: int,
+                decision: str,
+                reasons: List[str],
+                continuation_source: Optional[str] = None,
+                certificate_source: Optional[str] = None,
+            ) -> None:
+                cls = class_by_page.get(page_num)
+                if not cls:
+                    return
+                sig = dict(cls.signals or {})
+                sig["routing_decision"] = decision
+                sig["routing_reasons"] = reasons
+                sig["continuation_context_source"] = continuation_source or "none"
+                sig["certificate_evidence_source"] = certificate_source or sig.get("certificate_evidence_source", "none")
+                cls.signals = sig
+
+            desc_pages = sorted({
+                c.page_number for c in structure.page_table_classifications
+                if c.page_class == "scanned_image_only"
+                and any(
+                    z.zone_type == "description" and z.page_start <= c.page_number <= (z.page_end or z.page_start)
+                    for z in structure.zones
+                )
+            })
+            for p in desc_pages:
+                _set_page_decision(p, "scanned_supporting_misc", ["default_scanned_description_page"])
+            scanned_run_len_by_page: Dict[int, int] = {}
+            if desc_pages:
+                run: List[int] = [desc_pages[0]]
+                for p in desc_pages[1:]:
+                    if p == run[-1] + 1:
+                        run.append(p)
+                    else:
+                        for rp in run:
+                            scanned_run_len_by_page[rp] = len(run)
+                        run = [p]
+                for rp in run:
+                    scanned_run_len_by_page[rp] = len(run)
+            native_pages_sorted = sorted(emitted_native_by_page.keys())
+
+            def _find_anchor_table(page_num: int) -> Optional[CanonicalTable]:
+                next_candidates = [p for p in native_pages_sorted if p > page_num]
+                prev_candidates = [p for p in native_pages_sorted if p < page_num]
+                if next_candidates:
+                    return emitted_native_by_page[next_candidates[0]]
+                if prev_candidates:
+                    return emitted_native_by_page[prev_candidates[-1]]
+                return None
+
+            for page_num in desc_pages:
+                if page_num in emitted_native_by_page:
+                    continue
+                cls = class_by_page.get(page_num)
+                cls_signals = cls.signals or {} if cls else {}
+                family_hint = cls_signals.get("scanned_family_hint")
+                terminal_group = next((g for g in native_terminal_groups if page_num == (int(g["end"]) + 1)), None)
+                cert_ev = cls_signals.get("certificate_reference_evidence") or {}
+                cert_conf = float(cert_ev.get("confidence") or 0.0)
+                strong_certificate_signal = bool(
+                    cert_ev.get("is_certificate_reference")
+                    and cert_conf >= 0.35
+                    and (
+                        cert_ev.get("certificate_keyword_detected")
+                        or cert_ev.get("primary_employment_phrase_detected")
+                    )
+                )
+                if family_hint == "certificate_reference_evidence" or strong_certificate_signal:
+                    _set_page_decision(
+                        page_num,
+                        "certificate_reference_evidence",
+                        (
+                            ["family_hint_certificate_reference_evidence"]
+                            if family_hint == "certificate_reference_evidence"
+                            else ["certificate_reference_evidence_signals"]
+                        ),
+                        certificate_source=(
+                            cls_signals.get("certificate_evidence_source")
+                            or cert_ev.get("evidence_source")
+                            or cls_signals.get("scanned_family_text_source")
+                            or "none"
+                        ),
+                    )
+                    continue
+                # Keep continuation placeholders conservative: require a scanned run,
+                # unless this is a terminal scanned continuation page after a native multi-page table group.
+                if scanned_run_len_by_page.get(page_num, 0) < 2 and not terminal_group:
+                    _set_page_decision(page_num, "scanned_supporting_misc", ["scanned_run_too_short"])
+                    continue
+                prev_native = any((p < page_num and page_num - p <= 4) for p in native_pages_sorted)
+                next_native = any((p > page_num and p - page_num <= 4) for p in native_pages_sorted)
+                terminal_continuation = False
+                if terminal_group:
+                    prev_cls = class_by_page.get(int(terminal_group["end"]))
+                    prev_sig = prev_cls.signals or {} if prev_cls else {}
+                    curr_orient = cls_signals.get("is_landscape")
+                    prev_orient = prev_sig.get("is_landscape")
+                    same_orient_terminal = (
+                        curr_orient is None
+                        or prev_orient is None
+                        or curr_orient == prev_orient
+                    )
+                    shape_ok_terminal = bool(cls_signals.get("image_area_ratio", 0.0) >= 0.35)
+                    cont_sig = cls_signals.get("scanned_family_signals") or {}
+                    raw_text = pages_text[page_num - 1] if 0 < page_num <= len(pages_text) else ""
+                    raw_low = raw_text.lower()
+                    continuation_like_text = bool(
+                        (cont_sig.get("line_count", 0) >= 10)
+                        or (float(cls_signals.get("digit_ratio", 0.0) or 0.0) >= 0.03)
+                    )
+                    signature_footer_like = bool(
+                        re.search(r"\b(підпис|дата|прізвище|ініціали)\b", raw_low)
+                        or "м.п." in raw_low
+                    )
+                    terminal_continuation = bool(
+                        shape_ok_terminal
+                        and same_orient_terminal
+                        and (
+                            continuation_like_text
+                            or signature_footer_like
+                        )
+                    )
+
+                if not (prev_native or next_native or terminal_continuation):
+                    _set_page_decision(page_num, "scanned_supporting_misc", ["no_nearby_native_anchor_or_terminal_group"])
+                    continue
+
+                is_family_table = family_hint == "multi_page_table_family"
+
+                structural_continuity = False
+                for neighbor in (page_num - 1, page_num + 1):
+                    n_cls = class_by_page.get(neighbor)
+                    if not n_cls or n_cls.page_class != "scanned_image_only":
+                        continue
+                    n_signals = n_cls.signals or {}
+                    same_orient = cls_signals.get("is_landscape") == n_signals.get("is_landscape")
+                    img_curr = float(cls_signals.get("image_area_ratio", 0.0) or 0.0)
+                    img_nei = float(n_signals.get("image_area_ratio", 0.0) or 0.0)
+                    close_image_coverage = abs(img_curr - img_nei) <= 0.2
+                    if same_orient and close_image_coverage:
+                        structural_continuity = True
+                        break
+
+                if not (is_family_table or structural_continuity):
+                    if not terminal_continuation:
+                        _set_page_decision(page_num, "scanned_supporting_misc", ["weak_table_family_and_structure_continuity"])
+                        continue
+
+                anchor_table = _find_anchor_table(page_num)
+                anchor_ctx: Dict[str, Any] = {}
+                anchor_title = None
+                group_id = None
+                continuation_context_source = "native_financial_detail_anchor_context"
+
+                if terminal_continuation and terminal_group:
+                    group_id = f"native_multi_tbl_grp_p{int(terminal_group['start']):03d}_{int(terminal_group['end']):03d}"
+                    anchor_title = terminal_group.get("label") or "Native multi-page table continuation"
+                    anchor_ctx = {
+                        "table_title": terminal_group.get("label"),
+                        "subsubsection_title": terminal_group.get("label"),
+                        "subsection_anchor": None,
+                        "stage_label": None,
+                        "case_label": None,
+                        "table_group_id": group_id,
+                    }
+                    continuation_context_source = "native_multi_page_group_context"
+                elif anchor_table:
+                    anchor_ctx = anchor_table.context or {}
+                    group_id = anchor_ctx.get("table_group_id") or f"native_fin_detail_grp_p{anchor_table.page_start:03d}"
+                    anchor_title = anchor_table.title or "Scanned financial-detail continuation"
+                else:
+                    _set_page_decision(page_num, "scanned_supporting_misc", ["no_anchor_table_context"])
+                    continue
+
+                raw_text = pages_text[page_num - 1] if 0 < page_num <= len(pages_text) else ""
+                columns, rows, fallback_warnings = self._build_line_layout_rows(raw_text)
+                warnings = ["scanned_continuation_no_ocr"] + fallback_warnings
+                table_family = (
+                    "scanned_native_table_terminal_continuation_placeholder"
+                    if continuation_context_source == "native_multi_page_group_context"
+                    else "scanned_financial_detail_continuation_placeholder"
+                )
+
+                scanned_cont_table = CanonicalTable(
+                    table_id=f"tbl_scanned_fin_cont_p{page_num:03d}_01",
+                    table_family=table_family,
+                    zone_type="description",
+                    title=anchor_title or "Scanned table continuation",
+                    page_start=page_num,
+                    page_end=page_num,
+                    source={
+                        "parser": "pymupdf_native_bridge",
+                        "page_class": "scanned_image_only",
+                        "confidence": 0.7,
+                        "extraction_mode": "scanned_continuation_placeholder_no_ocr",
+                        "warnings": warnings,
+                    },
+                    context={
+                        "table_title": anchor_ctx.get("table_title"),
+                        "subsubsection_title": anchor_ctx.get("subsubsection_title"),
+                        "subsection_anchor": anchor_ctx.get("subsection_anchor"),
+                        "stage_label": anchor_ctx.get("stage_label"),
+                        "case_label": anchor_ctx.get("case_label"),
+                        "table_group_id": group_id,
+                        "continuation": True,
+                    },
+                    columns=columns,
+                    rows=rows,
+                    spans=[],
+                    validation={
+                        "row_count": len(rows),
+                        "column_count": len(columns),
+                        "header_row_indices": [],
+                        "semantic_mapping": {
+                            "applied": False,
+                            "confidence": 0.0,
+                            "header_row_index": None,
+                            "mapped_columns": {},
+                        },
+                        "normalization_warnings": warnings,
+                    },
+                )
+
+                structure.tables = [
+                    t for t in structure.tables
+                    if not (t.page_start == page_num and t.zone_type == "description")
+                ]
+                structure.tables.append(scanned_cont_table)
+                scanned_cont_pages.add(page_num)
+                decision_reasons = []
+                if is_family_table:
+                    decision_reasons.append("family_hint_multi_page_table_family")
+                if structural_continuity:
+                    decision_reasons.append("structural_continuity_neighbor_scanned_pages")
+                if terminal_continuation and terminal_group:
+                    decision_reasons.append("terminal_scanned_continuation_after_native_multi_page_group")
+                _set_page_decision(
+                    page_num,
+                    "routed_scanned_continuation",
+                    decision_reasons or ["continuation_inferred"],
+                    continuation_source=continuation_context_source,
+                )
+
+                # Ownership trimming: if preceding description paragraph includes table-start marker,
+                # keep only the narrative tail before the first marker.
+                prev_page = page_num - 1
+                if prev_page >= 1:
+                    markers = [
+                        anchor_ctx.get("table_title") or "",
+                        anchor_ctx.get("stage_label") or "",
+                        anchor_ctx.get("case_label") or "",
+                        "Обсяг фінансування за окремими статтями витрат",
+                        "Економічне обґрунтування витрат за статтею",
+                        "№ з/п",
+                        "Найменування статті витрат",
+                    ]
+                    markers = [m for m in markers if m]
+
+                    def _trim_page_paragraphs(page_to_trim: int):
+                        def _trim_block_text(text: str) -> Optional[str]:
+                            src = text or ""
+                            cut_idx = None
+                            for marker in markers:
+                                idx = src.find(marker)
+                                if idx >= 0 and (cut_idx is None or idx < cut_idx):
+                                    cut_idx = idx
+                            if cut_idx is None:
+                                return src
+                            kept = src[:cut_idx].strip()
+                            return kept if kept else None
+
+                        def _trim_in_section(sec: DocumentSection):
+                            new_blocks: List[DocumentBlock] = []
+                            for b in sec.blocks:
+                                if b.block_type != "paragraph" or b.page_number != page_to_trim:
+                                    new_blocks.append(b)
+                                    continue
+                                trimmed = _trim_block_text(b.text)
+                                if trimmed is None:
+                                    continue
+                                b.text = trimmed
+                                new_blocks.append(b)
+                            sec.blocks = new_blocks
+                            for sub in sec.subsections:
+                                _trim_in_section(sub)
+
+                        for z in structure.zones:
+                            if z.zone_type != "description":
+                                continue
+                            new_zone_blocks: List[DocumentBlock] = []
+                            for b in z.blocks:
+                                if b.block_type != "paragraph" or b.page_number != page_to_trim:
+                                    new_zone_blocks.append(b)
+                                    continue
+                                trimmed = _trim_block_text(b.text)
+                                if trimmed is None:
+                                    continue
+                                b.text = trimmed
+                                new_zone_blocks.append(b)
+                            z.blocks = new_zone_blocks
+                            for sec in z.sections:
+                                _trim_in_section(sec)
+
+                    _trim_page_paragraphs(prev_page)
+
+        self._suppress_routed_financial_detail_paragraphs(structure, routed_pages | scanned_cont_pages)
+
+    def _augment_scanned_tables_with_liteparse(
+        self,
+        file_content: bytes,
+        structure: ParsedDocumentStructure,
+        pages_text: Optional[List[str]] = None,
+    ):
         def _zone_for_page(page_number: int) -> Optional[str]:
             zone = next(
                 (z for z in structure.zones if z.page_start <= page_number <= (z.page_end or z.page_start)),
@@ -316,13 +2000,19 @@ class PdfParsingService:
             )
             return zone.zone_type if zone else None
 
-        # Narrow pilot: scanned annex/certificate pages only.
-        scanned_pages = [
-            c.page_number
-            for c in structure.page_table_classifications
-            if c.page_class == "scanned_image_only" and _zone_for_page(c.page_number) == "annex"
-        ]
-        if not scanned_pages:
+        pages_text = pages_text or []
+        routed_specs: List[Dict[str, Any]] = []
+        for cls in structure.page_table_classifications:
+            if cls.page_class != "scanned_image_only":
+                continue
+            zone_type = _zone_for_page(cls.page_number)
+            if zone_type == "annex":
+                routed_specs.append({"page_number": cls.page_number, "route_family": "annex_scanned"})
+                continue
+            if zone_type == "description" and self._is_financial_detail_candidate_page(cls.page_number, pages_text):
+                routed_specs.append({"page_number": cls.page_number, "route_family": "financial_detail_scanned"})
+
+        if not routed_specs:
             return
 
         if not self.enrichment_service.cli_available:
@@ -331,10 +2021,10 @@ class PdfParsingService:
             structure.metadata["liteparse_scanned_routing_warning"] = "LiteParse CLI not available; scanned routing skipped."
             return
 
-        pages_arg = ",".join(str(p) for p in scanned_pages)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(file_content)
-            tmp_path = tmp.name
+        page_numbers = sorted({int(spec["page_number"]) for spec in routed_specs})
+        pages_arg = ",".join(str(p) for p in page_numbers)
+        spec_by_page = {int(spec["page_number"]): spec["route_family"] for spec in routed_specs}
+        tmp_path, orientation_meta = self._prepare_liteparse_pdf_with_orientation_normalization(file_content, page_numbers)
 
         try:
             liteparse_result = self.enrichment_service.run_liteparse_cli(
@@ -352,6 +2042,11 @@ class PdfParsingService:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+        prev_ctx: Dict[str, Optional[str]] = {}
+        prev_page: Optional[int] = None
+        continuation_group: Optional[str] = None
+        financial_detail_pages: Set[int] = set()
+
         for page_data in liteparse_result.get("pages", []):
             page_num = page_data.get("page_number") or page_data.get("page")
             if not isinstance(page_num, int):
@@ -361,23 +2056,46 @@ class PdfParsingService:
             if not cls or cls.page_class != "scanned_image_only":
                 continue
 
-            raw_text = page_data.get("text") or ""
-            lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines() if ln and ln.strip()]
-            warnings: List[str] = []
-            if not lines:
-                warnings.append("no_text_from_liteparse")
+            route_family = spec_by_page.get(page_num)
+            if not route_family:
+                continue
 
-            rows: List[CanonicalTableRow] = []
-            for idx, line in enumerate(lines):
-                rows.append(
-                    CanonicalTableRow(
-                        row_id=f"r{idx}",
-                        cells=[
-                            CanonicalTableCell(col_id="c0", text=str(idx + 1), normalized=idx + 1),
-                            CanonicalTableCell(col_id="c1", text=line, normalized=line),
-                        ],
-                    )
+            raw_text = page_data.get("text") or ""
+            context: Dict[str, Optional[str]] = {}
+            context_start_idx = 0
+            prev_ctx_snapshot = prev_ctx.copy()
+            detected_ctx: Dict[str, bool] = {}
+            if route_family == "financial_detail_scanned":
+                context, context_start_idx, detected_ctx = self._extract_scanned_financial_context(raw_text, prev_ctx)
+                financial_detail_pages.add(page_num)
+            trimmed_text = self._trim_text_to_financial_context(raw_text, context_start_idx)
+            start_y = self._context_start_y_from_text_items(page_data, context) if context else None
+
+            grouped, columns, rows, header_rows, grouping_warnings = self._build_light_table_from_text_items(
+                page_data,
+                min_y=start_y,
+            )
+            fallback_warnings: List[str] = []
+            semantic_warnings: List[str] = []
+            semantic_meta: Dict[str, Any] = {
+                "applied": False,
+                "confidence": 0.0,
+                "header_row_index": None,
+                "mapped_columns": {},
+            }
+            if not grouped:
+                columns, rows, fallback_warnings = self._build_line_layout_rows(trimmed_text)
+            else:
+                columns, semantic_meta, semantic_warnings = self._apply_scanned_semantic_column_mapping(columns, rows, header_rows)
+            warnings = grouping_warnings + semantic_warnings + fallback_warnings
+            if route_family == "financial_detail_scanned":
+                extraction_mode = (
+                    "scanned_financial_detail_route_light_table"
+                    if grouped else
+                    "scanned_financial_detail_route_line_fallback"
                 )
+            else:
+                extraction_mode = "scanned_page_only_route_light_table" if grouped else "scanned_page_only_route_line_fallback"
 
             page_zone = next(
                 (z for z in structure.zones if z.page_start <= page_num <= (z.page_end or z.page_start)),
@@ -385,29 +2103,65 @@ class PdfParsingService:
             )
             zone_type = page_zone.zone_type if page_zone else "unknown"
 
+            orientation = orientation_meta.get(page_num, {})
+            continuation = False
+            if route_family == "financial_detail_scanned":
+                has_fresh_context = any(detected_ctx.get(k, False) for k in ("subsubsection_title", "stage_label", "case_label"))
+                if prev_page is not None and page_num == (prev_page + 1):
+                    same_context = (
+                        context.get("subsubsection_title") == prev_ctx_snapshot.get("subsubsection_title")
+                        and context.get("stage_label") == prev_ctx_snapshot.get("stage_label")
+                        and context.get("case_label") == prev_ctx_snapshot.get("case_label")
+                    )
+                    if same_context or not has_fresh_context:
+                        continuation = True
+                if continuation and continuation_group:
+                    group_id = continuation_group
+                else:
+                    group_id = f"fin_detail_grp_p{page_num:03d}"
+                    continuation_group = group_id
+                prev_page = page_num
+                prev_ctx = context.copy()
+            else:
+                group_id = None
+
+            table_family = "scanned_page_ocr_layout" if route_family == "annex_scanned" else "scanned_financial_detail_ocr_layout"
+            table_title = "LiteParse OCR Layout Lines"
+            if route_family == "financial_detail_scanned":
+                table_title = context.get("subsubsection_title") or context.get("stage_label") or "Scanned financial detail OCR layout"
+
             scanned_table = CanonicalTable(
-                table_id=f"tbl_scanned_liteparse_p{page_num:03d}_01",
-                table_family="scanned_page_ocr_layout",
+                table_id=f"tbl_{table_family}_p{page_num:03d}_01",
+                table_family=table_family,
                 zone_type=zone_type,
-                title="LiteParse OCR Layout Lines",
+                title=table_title,
                 page_start=page_num,
                 page_end=page_num,
                 source={
                     "parser": "liteparse_cli",
                     "page_class": cls.page_class,
                     "confidence": cls.confidence,
-                    "extraction_mode": "scanned_page_only_route",
+                    "extraction_mode": extraction_mode,
+                    "orientation": orientation,
+                    "semantic_mapping_confidence": semantic_meta.get("confidence", 0.0),
                     "warnings": warnings,
                 },
-                columns=[
-                    CanonicalTableColumn(col_id="c0", name="line_number", semantic_type="int"),
-                    CanonicalTableColumn(col_id="c1", name="ocr_text", semantic_type="string"),
-                ],
+                context={
+                    "subsubsection_title": context.get("subsubsection_title") if context else None,
+                    "subsection_anchor": context.get("subsection_anchor") if context else None,
+                    "stage_label": context.get("stage_label") if context else None,
+                    "case_label": context.get("case_label") if context else None,
+                    "table_group_id": group_id,
+                    "continuation": continuation,
+                },
+                columns=columns,
                 rows=rows,
                 spans=[],
                 validation={
                     "row_count": len(rows),
-                    "column_count": 2,
+                    "column_count": len(columns),
+                    "header_row_indices": header_rows,
+                    "semantic_mapping": semantic_meta,
                     "normalization_warnings": warnings,
                 },
             )
@@ -415,11 +2169,13 @@ class PdfParsingService:
             structure.tables = [
                 t for t in structure.tables
                 if not (
-                    t.table_family == "scanned_page_ocr_layout"
+                    t.table_family == table_family
                     and t.page_start == page_num
                 )
             ]
             structure.tables.append(scanned_table)
+
+        self._suppress_routed_financial_detail_paragraphs(structure, financial_detail_pages)
 
     def _reconstruct_structure(
         self,
@@ -1028,6 +2784,9 @@ class PdfParsingService:
         financial_zone = next((z for z in structure.zones if z.zone_type == "financial"), None)
         if financial_zone:
             self._extract_financial_summary(financial_zone, structure)
+
+        # Layer 2: Add canonical tables for native_text_complex_table financial-detail pages in Zone 2.
+        self._augment_native_complex_description_tables(structure, pages_text)
             
         # Layer 2: Detect certificate / compliance document subtypes in Zone 7
         annex_zone = next((z for z in structure.zones if z.zone_type == "annex"), None)
@@ -1068,51 +2827,168 @@ class PdfParsingService:
         return structure
 
     def _extract_institution_profile(self, zone: DocumentZone, pages: List[str], structure: ParsedDocumentStructure):
-        """Extract structured fields from Institution Profile (Zone 4) using regex."""
-        if not structure.metadata: structure.metadata = {}
-        inst_data = {}
-        
-        full_zone_text = "\n".join([block.text for block in zone.blocks])
-        
-        # Mapping labels to fields with improved regex
-        regex_map = {
-            "institution_name": r"(?:Назва\s+установи|Учасник\s+конкурсу(?:\/субвиконавці)?)\s*:?\s*(.+)",
-            "edrpou_code": r"Код\s+ЄДРПОУ\s*:?\s*(\d{8})",
-            "kved_code": r"Код\(и\)\s+КВЕД\s*:?\s*([\d\.,\s]{5,})",
-            "legal_address": r"Юридична\s+адреса\s*:?\s*(.+)",
-            "postal_address": r"Поштова\s+адреса\s*:?\s*(.+)",
-            "physical_address": r"Фактична\s+адреса\s*:?\s*(.+)",
-            "phone_number": r"Телефон\s*:?\s*([\+\d\s\-\(\)]+)",
-            "email": r"Адреса\s+електронної\s+пошти\s*:?\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
-            "website": r"Посилання\s+на\s+веб\s*сторінку\s*:?\s*(https?://[^\s]+|www\.[^\s]+)",
-        }
+        """Extract structured fields from Institution Profile (Zone 4) as flat label->value pairs."""
+        if not structure.metadata:
+            structure.metadata = {}
+        inst_data: Dict[str, Any] = {}
+
+        zone_block_text = "\n".join([block.text for block in zone.blocks])
+        zone_page_text = "\n".join(
+            pages[p - 1]
+            for p in range(zone.page_start, (zone.page_end or zone.page_start) + 1)
+            if 0 <= (p - 1) < len(pages)
+        ).strip()
+        full_zone_text = zone_page_text if zone_page_text else zone_block_text
+        lines = [re.sub(r"\s+", " ", l.strip()) for l in full_zone_text.split("\n") if l and l.strip()]
+
+        if not lines:
+            structure.metadata["institution_profile"] = inst_data
+            return
 
         labels_to_check = [
-            "Назва установи", "Код ЄДРПОУ", "Код(и) КВЕД", "Юридична адреса", 
-            "Поштова адреса", "Фактична адреса", "Телефон", "Адреса електронної пошти", 
-            "Посилання на веб сторінку", "підприємства/установи/організації"
+            "Назва установи",
+            "Учасник конкурсу",
+            "Код ЄДРПОУ",
+            "Код(и) КВЕД",
+            "Юридична адреса",
+            "Поштова адреса",
+            "Фактична адреса",
+            "Телефон",
+            "Адреса електронної пошти",
+            "Посилання на веб сторінку",
+            "Організаційно-правова форма",
+            "Підпорядкованість",
+            "ПІБ керівника",
+            "підприємства/установи/організації",
         ]
 
-        for field, pattern in regex_map.items():
-            match = re.search(pattern, full_zone_text, re.IGNORECASE | re.MULTILINE)
-            if match:
-                val = match.group(1).strip()
-                # Semantic validation
-                is_valid = True
-                if field == "edrpou_code" and not re.match(r"^\d{8}$", val): is_valid = False
-                if field in ["legal_address", "physical_address", "postal_address"]:
-                    if not SemanticValidator.is_address(val, labels_to_check): is_valid = False
-                if field == "phone_number" and not SemanticValidator.is_phone(val): is_valid = False
-                if field == "email" and not SemanticValidator.is_email(val): is_valid = False
-                
-                if is_valid:
-                    inst_data[field] = val
-                else:
-                    inst_data[field] = None
+        label_specs = [
+            ("organization_type", r"організац\w*[-\s]правов\w*\s+форм"),
+            ("parent_organization", r"підпорядкован\w+"),
+            ("institution_head_name", r"(?:піб|прізвище.*ім[я'’]).*керівник"),
+            ("legal_address", r"юридичн\w+\s+адрес"),
+            ("postal_address", r"поштов\w+\s+адрес"),
+            ("physical_address", r"фактичн\w+\s+адрес"),
+            ("edrpou_code", r"код\s+єдрпоу"),
+            ("kved_code", r"код(?:\(и\))?\s+квед"),
+            ("phone_number", r"\bтелефон\b"),
+            ("email", r"адреса\s+електронн\w+\s+пошт"),
+            ("website", r"посилання\s+на\s+веб"),
+        ]
 
-        # Fallback for institution name if not matched by label
+        compiled_specs = [(field, re.compile(pattern, re.IGNORECASE)) for field, pattern in label_specs]
+        continuation_label_re = re.compile(
+            r"^(?:/|підприємства/установи/організації|установи/організації|організації|де працює учасник)\b",
+            re.IGNORECASE,
+        )
+
+        def _build_label_candidate(start_idx: int) -> Tuple[str, int]:
+            candidate = lines[start_idx]
+            consumed = 1
+            if start_idx + 1 < len(lines) and continuation_label_re.search(lines[start_idx + 1]):
+                candidate = f"{candidate} {lines[start_idx + 1]}"
+                consumed = 2
+            return candidate.lower(), consumed
+
+        def _looks_like_label(line: str) -> bool:
+            low = line.lower()
+            if any(cre.search(low) for _, cre in compiled_specs):
+                return True
+            return continuation_label_re.search(low) is not None
+
+        def _extract_inline_value(label_idx: int) -> str:
+            line = lines[label_idx]
+            if ":" in line:
+                inline = line.split(":", 1)[1].strip()
+                if inline and not _looks_like_label(inline):
+                    return inline
+            return ""
+
+        label_hits: Dict[str, Tuple[int, int]] = {}
+        for i in range(len(lines)):
+            label_candidate, consumed = _build_label_candidate(i)
+            for field, cre in compiled_specs:
+                if field in label_hits:
+                    continue
+                if cre.search(label_candidate):
+                    label_hits[field] = (i, consumed)
+
+        # Institution name is usually the first non-label line on this flat page.
+        for ln in lines[:6]:
+            if (
+                len(ln) >= 10
+                and not _looks_like_label(ln)
+                and not re.search(r"\bучасник\b", ln, re.IGNORECASE)
+            ):
+                inst_data["institution_name"] = ln
+                break
+
+        ordered_hits = sorted((idx, consumed, field) for field, (idx, consumed) in label_hits.items())
+        for pos, (idx, consumed, field) in enumerate(ordered_hits):
+            next_idx = ordered_hits[pos + 1][0] if pos + 1 < len(ordered_hits) else len(lines)
+            inline = _extract_inline_value(idx)
+
+            value_lines: List[str] = []
+            if inline:
+                value_lines.append(inline)
+
+            start = idx + consumed
+            while start < next_idx and continuation_label_re.search(lines[start]):
+                start += 1
+
+            for j in range(start, next_idx):
+                candidate = lines[j].strip()
+                if not candidate:
+                    continue
+                if _looks_like_label(candidate):
+                    break
+                value_lines.append(candidate)
+                # Most fields are one-line values; addresses and organization type may span lines.
+                if field not in {"organization_type", "legal_address", "postal_address", "physical_address"} and len(value_lines) >= 1:
+                    break
+                if field in {"organization_type", "legal_address", "postal_address", "physical_address"} and len(value_lines) >= 3:
+                    break
+
+            value = re.sub(r"\s+", " ", " ".join(value_lines)).strip(" ,;")
+            if not value:
+                continue
+
+            if field == "edrpou_code":
+                m = re.search(r"\b(\d{8})\b", value)
+                if m:
+                    inst_data[field] = m.group(1)
+                continue
+            if field == "kved_code":
+                kveds = re.findall(r"\b\d{2}\.\d{2}\b", value)
+                if kveds:
+                    inst_data[field] = ", ".join(dict.fromkeys(kveds))
+                continue
+            if field == "phone_number":
+                m = re.search(r"(\+?\d[\d\s\-\(\)]{6,}\d)", value)
+                if m:
+                    candidate = re.sub(r"\s+", " ", m.group(1)).strip()
+                    if SemanticValidator.is_phone(candidate):
+                        inst_data[field] = candidate
+                continue
+            if field == "email":
+                m = re.search(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", value)
+                if m and SemanticValidator.is_email(m.group(1)):
+                    inst_data[field] = m.group(1)
+                continue
+            if field == "website":
+                m = re.search(r"(https?://[^\s]+|www\.[^\s]+)", value, re.IGNORECASE)
+                if m:
+                    inst_data[field] = m.group(1).rstrip(".,;")
+                continue
+            if field in {"legal_address", "postal_address", "physical_address"}:
+                if SemanticValidator.is_address(value, labels_to_check):
+                    inst_data[field] = value
+                continue
+
+            inst_data[field] = value
+
+        # Keep legacy institution-name fallback for robustness.
         if "institution_name" not in inst_data:
-            lines = [l.strip() for l in full_zone_text.split("\n") if l.strip()]
             if lines and len(lines[0]) > 10:
                 inst_data["institution_name"] = lines[0]
 
@@ -1130,123 +3006,664 @@ class PdfParsingService:
             zone.blocks = [b for b in zone.blocks if b.block_type != "metadata_block" or b == main_block]
 
     def _extract_pi_profile(self, zone: DocumentZone, pages: List[str], structure: ParsedDocumentStructure):
-        """Extract structured fields from PI Profile (Zone 5)."""
-        if not structure.metadata: structure.metadata = {}
-        
+        """Extract structured fields from PI Profile (Zone 5) using subsection-aware parsing."""
+        if not structure.metadata:
+            structure.metadata = {}
+
         pi_name, pi_title, pi_degree = SemanticValidator.clean_name_and_get_titles(structure.pi_name or "")
-        pi_data = {
-            "name": pi_name,
-            "title": pi_title,
-            "degree": pi_degree
-        }
-        
-        full_zone_text = ""
-        for block in zone.blocks:
-            full_zone_text += block.text + "\n"
+        pi_data: Dict[str, Any] = {"name": pi_name}
+        if pi_title:
+            pi_data["title"] = pi_title
+        if pi_degree:
+            pi_data["degree"] = pi_degree
 
-        lines = [re.sub(r"\s+", " ", l.strip()) for l in full_zone_text.split("\n") if l.strip()]
-        label_specs = [
-            ("gender", r"Стать"),
-            ("birth_date", r"Дата\s+народження"),
-            ("citizenship", r"Громадянство"),
-            ("orcid", r"ORCID"),
-            ("h_index_scopus", r"Індекс\s+Хірша\s+\(SCOPUS\)"),
-            ("total_publications", r"Загальна\s+кількість\s+публікацій"),
-            ("degree_raw", r"Науковий\s+ступінь"),
-            ("position", r"Посада"),
-            ("phone", r"(?:Мобільний\s+)?телефон"),
-            ("email", r"Електронна\s+пошта"),
-        ]
+        full_zone_text = "\n".join(block.text for block in zone.blocks if block.text)
+        lines = [re.sub(r"\s+", " ", l.strip()) for l in full_zone_text.split("\n") if l and l.strip()]
+        if not lines:
+            structure.metadata["pi_profile"] = pi_data
+            return
 
-        label_compiled = [(field, re.compile(r"^" + pat + r"\s*:?\s*(.*)$", re.IGNORECASE)) for field, pat in label_specs]
-        any_label_re = re.compile(r"^(?:" + "|".join(["(?:%s)" % pat for _, pat in label_specs]) + r")\b", re.IGNORECASE)
-        forbidden_values = {
-            "мобільний телефон",
-            "телефон",
-            "електронна пошта",
-            "громадянство",
-            "посада",
-            "науковий ступінь",
-        }
+        def _clean_value(value: str) -> str:
+            cleaned = re.sub(r"\s+", " ", value or "").strip(" ,;:-")
+            return re.sub(r"^\-\s*", "", cleaned).strip()
 
-        def _extract_value_window(start_idx: int, inline_value: str) -> str:
-            values: List[str] = []
-            if inline_value:
-                values.append(inline_value.strip())
+        def _extract_labeled_values(text: str, field_specs: Dict[str, List[str]]) -> Dict[str, str]:
+            if not text:
+                return {}
+            compact = re.sub(r"\s+", " ", text).strip()
+            if not compact:
+                return {}
+            all_label_patterns = [pat for patterns in field_specs.values() for pat in patterns]
+            if not all_label_patterns:
+                return {}
+            any_label = "(?:" + "|".join(f"(?:{pat})" for pat in all_label_patterns) + ")"
 
-            # Take only a small local window to avoid cross-field bleed.
-            for j in range(start_idx + 1, min(len(lines), start_idx + 4)):
-                candidate = lines[j].strip()
-                if not candidate:
+            out: Dict[str, str] = {}
+            for field, patterns in field_specs.items():
+                for pat in patterns:
+                    regex = re.compile(
+                        rf"(?:^|\s){pat}\s*[:\-]?\s*(.+?)(?=\s*(?:{any_label})\s*[:\-]?|$)",
+                        re.IGNORECASE,
+                    )
+                    match = regex.search(compact)
+                    if not match:
+                        continue
+                    value = _clean_value(match.group(1))
+                    if value:
+                        out[field] = value
+                        break
+            return out
+
+        def _split_profile_sections(profile_lines: List[str]) -> Dict[str, List[str]]:
+            sections: Dict[str, List[str]] = {
+                "personal_contact": [],
+                "scientific_profile": [],
+                "scientific_activity": [],
+                "publications": [],
+                "monographs_patents": [],
+                "education": [],
+                "workplaces": [],
+                "scientific_degree": [],
+                "academic_titles": [],
+                "appendix_visual_proof": [],
+            }
+            heading_specs = [
+                ("scientific_profile", [r"науковий\s+профіл"]),
+                ("scientific_activity", [r"наукова\s+діяльн"]),
+                ("publications", [r"перелік\s+праць", r"перелік\s+публікац"]),
+                ("monographs_patents", [r"перелік\s+монограф", r"перелік\s+монографій\s+або\s+патент"]),
+                ("education", [r"^\s*освіта\b"]),
+                ("workplaces", [r"місце\s+роботи", r"та\s+посада"]),
+                ("scientific_degree", [r"науковий\s+ступінь"]),
+                ("academic_titles", [r"академічне\s+або\s+вчене\s+звання", r"вчене\s+звання"]),
+                (
+                    "appendix_visual_proof",
+                    [
+                        r"сертифікат",
+                        r"диплом",
+                        r"довідка",
+                        r"додат",
+                        r"curriculum\s+vitae",
+                        r"контактна\s+інформац",
+                        r"основні\s+наукові\s+досягнення",
+                    ],
+                ),
+            ]
+            current = "personal_contact"
+            saw_structured_section = False
+            cv_transition_patterns = [
+                r"curriculum\s+vitae",
+                r"контактна\s+інформац",
+                r"основні\s+наукові\s+досягнення",
+                r"досвід\s+професійн",
+                r"науково[-\s]організаційн",
+                r"участь\s+у\s+колективних",
+                r"популяризац",
+            ]
+
+            def _is_cv_transition(line_text: str) -> bool:
+                low_text = line_text.lower()
+                if any(re.search(pat, low_text, re.IGNORECASE) for pat in cv_transition_patterns):
+                    return True
+                if re.match(r"^\d+\)\s+", line_text) and len(line_text) > 45:
+                    return True
+                if len(line_text) > 120 and sum(1 for _ in re.finditer(r"[,:;]", line_text)) >= 3:
+                    return True
+                return False
+
+            for line in profile_lines:
+                low = line.lower()
+                matched = False
+                for key, patterns in heading_specs:
+                    if any(re.search(pat, low, re.IGNORECASE) for pat in patterns):
+                        current = key
+                        if key != "appendix_visual_proof":
+                            saw_structured_section = True
+                        else:
+                            sections["appendix_visual_proof"].append(line)
+                        matched = True
+                        break
+                if matched:
                     continue
-                if any_label_re.search(candidate):
-                    break
-                # Stop on obvious table/header-like labels.
-                if candidate.isupper() and len(candidate.split()) <= 4:
-                    break
-                values.append(candidate)
-                if len(values) >= 2:
-                    break
+                if (
+                    current != "appendix_visual_proof"
+                    and saw_structured_section
+                    and current in {"academic_titles", "workplaces", "education", "scientific_degree"}
+                    and _is_cv_transition(line)
+                ):
+                    current = "appendix_visual_proof"
+                sections[current].append(line)
+            return sections
 
-            combined = re.sub(r"\s+", " ", " ".join(values)).strip()
-            return re.sub(r"^\-\s*", "", combined).strip()
+        def _extract_list_items(section_lines: List[str]) -> List[Dict[str, Any]]:
+            items: List[Dict[str, Any]] = []
+            current: List[str] = []
+            for raw in section_lines:
+                line = _clean_value(raw)
+                if not line:
+                    continue
+                if re.search(r"конкурс[іу]|не\s+більше", line, re.IGNORECASE):
+                    continue
+                starts_new = bool(re.match(r"^\d{1,2}[.)]\s+", line)) or bool(re.search(r"\b10\.\d{4,9}/\S+", line, re.IGNORECASE))
+                if starts_new and current:
+                    joined = _clean_value(" ".join(current))
+                    if joined and len(joined) > 12:
+                        items.append({"text": joined})
+                    current = []
+                current.append(re.sub(r"^\d{1,2}[.)]\s+", "", line))
+            if current:
+                joined = _clean_value(" ".join(current))
+                if joined and len(joined) > 12:
+                    items.append({"text": joined})
+            for idx, item in enumerate(items, start=1):
+                item["item_index"] = idx
+                doi_match = re.search(r"\b10\.\d{4,9}/\S+", item["text"], re.IGNORECASE)
+                if doi_match:
+                    item["doi"] = doi_match.group(0).rstrip(".,;")
+                    body = _clean_value(item["text"].replace(item["doi"], "", 1))
+                    year_matches = re.findall(r"\b((?:19|20)\d{2})\b", body)
+                    if year_matches:
+                        item["year"] = year_matches[-1]
+                    title_match = re.search(r"\b([A-Z][A-Z0-9\-\(\),']+(?:\s+[A-Z][A-Z0-9\-\(\),']+){3,})\b", body)
+                    if title_match:
+                        authors = _clean_value(body[:title_match.start()])
+                        title = _clean_value(title_match.group(1))
+                        journal = _clean_value(body[title_match.end():])
+                        if authors and "," in authors:
+                            item["authors_list"] = authors
+                        if title:
+                            item["title"] = title
+                        if journal:
+                            item["journal"] = journal
+            return items
 
-        def _truncate_after_markers(value: str, markers: List[str]) -> str:
+        def _extract_typed_monograph_items(section_lines: List[str]) -> List[Dict[str, Any]]:
+            items = _extract_list_items(section_lines)
+            if len(items) <= 1:
+                merged_text = _clean_value(" ".join(section_lines))
+                split_starts = [
+                    m.start()
+                    for m in re.finditer(
+                        r"(?:№\s*)?(?:\d{5,6}|97[89][\-\d]{8,20})\s*,?\s*(?:19|20)\d{2}\s*[:\-]",
+                        merged_text,
+                        flags=re.IGNORECASE,
+                    )
+                ]
+                if len(split_starts) >= 2:
+                    split_items: List[Dict[str, Any]] = []
+                    for idx, start in enumerate(split_starts):
+                        end = split_starts[idx + 1] if idx + 1 < len(split_starts) else len(merged_text)
+                        chunk = _clean_value(merged_text[start:end])
+                        if chunk:
+                            split_items.append({"text": chunk})
+                    if split_items:
+                        items = split_items
+            for item in items:
+                low = item.get("text", "").lower()
+                if "монограф" in low or re.search(r"\b97[89]-\d", item.get("text", "")):
+                    item["item_type"] = "monograph"
+                elif (
+                    "патент" in low
+                    or re.search(r"\b№\s*\S+", item.get("text", ""))
+                    or re.search(r"^\s*\d{5,6}\s*,?\s*(?:19|20)\d{2}\s*[:\-]", item.get("text", ""))
+                ):
+                    item["item_type"] = "patent"
+                else:
+                    item["item_type"] = "other"
+            for idx, item in enumerate(items, start=1):
+                item["item_index"] = idx
+            return items
+
+        def _extract_academic_titles(section_lines: List[str]) -> List[str]:
+            titles: List[str] = []
+            title_markers = [
+                "професор",
+                "доцент",
+                "старший науковий співробітник",
+                "член-кореспондент",
+                "академік",
+            ]
+            for line in section_lines:
+                for chunk in re.split(r"[;,]", line):
+                    value = _clean_value(chunk)
+                    if (
+                        value
+                        and len(value) > 2
+                        and not re.search(r"звання", value, re.IGNORECASE)
+                        and any(marker in value.lower() for marker in title_markers)
+                    ):
+                        titles.append(value)
+            deduped: List[str] = []
+            seen = set()
+            for title in titles:
+                low = title.lower()
+                if low in seen:
+                    continue
+                seen.add(low)
+                deduped.append(title)
+            return deduped
+
+        def _extract_subsection_fields(
+            section_lines: List[str],
+            label_patterns: Dict[str, List[str]],
+            multiline_fields: Optional[Set[str]] = None,
+        ) -> Dict[str, str]:
+            multiline_fields = multiline_fields or set()
+            lines_local = [_clean_value(x) for x in section_lines if _clean_value(x)]
+            if not lines_local:
+                return {}
+
+            def _line_is_label(line_text: str) -> bool:
+                for patterns in label_patterns.values():
+                    for pat in patterns:
+                        if re.search(pat, line_text, re.IGNORECASE):
+                            return True
+                return False
+
+            extracted: Dict[str, str] = {}
+            idx = 0
+            while idx < len(lines_local):
+                line = lines_local[idx]
+                matched_field: Optional[str] = None
+                matched_end = -1
+                for field, patterns in label_patterns.items():
+                    for pat in patterns:
+                        m = re.search(pat, line, re.IGNORECASE)
+                        if not m:
+                            continue
+                        if matched_field is None or m.start() < matched_end:
+                            matched_field = field
+                            matched_end = m.end()
+                if not matched_field:
+                    idx += 1
+                    continue
+
+                values: List[str] = []
+                inline = _clean_value(line[matched_end:])
+                if inline and not _line_is_label(inline):
+                    values.append(inline)
+
+                j = idx + 1
+                while j < len(lines_local):
+                    nxt = lines_local[j]
+                    if _line_is_label(nxt):
+                        break
+                    values.append(nxt)
+                    if matched_field not in multiline_fields:
+                        break
+                    if len(values) >= 4:
+                        break
+                    j += 1
+
+                value = _clean_value(" ".join(values))
+                if value and matched_field not in extracted:
+                    extracted[matched_field] = value
+                idx = max(j, idx + 1)
+            return extracted
+
+        def _infer_institution_name(section_lines: List[str], label_patterns: Dict[str, List[str]]) -> Optional[str]:
+            candidates: List[str] = []
+            for raw in section_lines:
+                line = _clean_value(raw)
+                if not line:
+                    continue
+                if re.search(r"https?://|www\.", line, re.IGNORECASE):
+                    continue
+                if re.search(r"\b\d{4}\s*[-–]\s*\d{4}\b", line):
+                    continue
+                if any(re.search(pat, line, re.IGNORECASE) for pats in label_patterns.values() for pat in pats):
+                    continue
+                if re.search(r"інститут|університет|академ|нан\s+україни|кпі", line, re.IGNORECASE):
+                    candidates.append(line)
+            if not candidates:
+                return None
+            return max(candidates, key=len)
+
+        def _normalize_ua_phone(value: str) -> Optional[str]:
             if not value:
-                return value
-            truncated = value
-            for marker in markers:
-                truncated = re.sub(marker + r".*$", "", truncated, flags=re.IGNORECASE).strip()
-            return truncated
+                return None
+            digits = re.sub(r"\D", "", value)
+            if digits.startswith("80") and len(digits) == 11:
+                digits = "3" + digits
+            elif digits.startswith("0") and len(digits) == 10:
+                digits = "38" + digits
+            elif digits.startswith("44") and len(digits) == 9:
+                digits = "380" + digits
+            candidate = f"+{digits}" if digits else None
+            return candidate if candidate and SemanticValidator.is_phone(candidate) else None
 
-        extracted_values: Dict[str, str] = {}
-        for i, line in enumerate(lines):
-            for field, cre in label_compiled:
-                if field in extracted_values:
-                    continue
-                m = cre.match(line)
-                if not m:
-                    continue
-                value = _extract_value_window(i, m.group(1) or "")
-                if value:
-                    extracted_values[field] = value
+        sections = _split_profile_sections(lines)
+        personal_text = " ".join(sections["personal_contact"])
+        personal_fields = _extract_labeled_values(
+            personal_text,
+            {
+                "gender": [r"стать"],
+                "birth_date": [r"дата\s+народження"],
+                "country_of_residence": [r"країна\s+постійного\s+проживання"],
+                "citizenship": [r"громадянство"],
+                "mobile_phone": [r"мобільний\s+телефон", r"(?<!робочий\s)телефон"],
+                "email": [r"e-?mail", r"електронна\s+пошта"],
+                "other_contacts": [r"інші\s+контакти(?:\s*\([^)]+\))?"],
+            },
+        )
 
-        for field, value in extracted_values.items():
-            norm_value = value.strip()
-            if not norm_value:
+        for key in ("gender", "birth_date", "country_of_residence"):
+            if personal_fields.get(key):
+                pi_data[key] = personal_fields[key]
+        if personal_fields.get("citizenship"):
+            cit = personal_fields["citizenship"]
+            if re.search(r"мобіль|телефон|пошта|контакт", cit, re.IGNORECASE):
+                cit = ""
+            if cit and SemanticValidator.is_citizenship(cit):
+                pi_data["citizenship"] = cit
+        if personal_fields.get("mobile_phone") and SemanticValidator.is_phone(personal_fields["mobile_phone"]):
+            pi_data["mobile_phone"] = personal_fields["mobile_phone"]
+            # Keep backward-compatible alias while preserving split-contact schema.
+            pi_data["phone"] = personal_fields["mobile_phone"]
+        if personal_fields.get("email") and SemanticValidator.is_email(personal_fields["email"]):
+            pi_data["email"] = personal_fields["email"].lower()
+        if personal_fields.get("other_contacts"):
+            pi_data["other_contacts"] = personal_fields["other_contacts"]
+
+        scientific_profile_text = " ".join(sections["scientific_profile"])
+        scientific_profile_fields = _extract_labeled_values(
+            scientific_profile_text,
+            {
+                "scientific_experience_years": [r"науковий\s+стаж[,\s]+кількість\s+років"],
+                "total_patents": [r"загальна\s+кількість\s+патентів"],
+                "total_publications": [r"загальна\s+кількість\s+публікацій"],
+                "q1_q2_publications_10years": [r"кількість\s+публікацій\s+у\s+виданнях\s+1-го\s+[—\-]\s*2-го\s+квартил"],
+                "h_index_scopus": [r"індекс\s+хірша\s*\(?.{0,10}scopus.*?\)?"],
+                "total_monographs": [r"кількість\s+монографій"],
+                "total_grants": [r"гранти[, ]+отримані\s+на\s+дослідження"],
+                "expert_experience": [r"досвід\s+проведення\s+експертизи"],
+            },
+        )
+        profile_urls = re.findall(r"(https?://[^\s,;]+|www\.[^\s,;]+)", scientific_profile_text, re.IGNORECASE)
+        profile_urls = [u.rstrip(".,;") for u in profile_urls]
+        scientific_profile_obj: Dict[str, Any] = {}
+        if profile_urls:
+            scientific_profile_obj["profile_urls"] = list(dict.fromkeys(profile_urls))
+        metrics = {k: v for k, v in scientific_profile_fields.items() if k != "expert_experience" and v}
+        if metrics:
+            scientific_profile_obj["metrics"] = metrics
+        if scientific_profile_fields.get("expert_experience"):
+            scientific_profile_obj["expert_experience"] = scientific_profile_fields["expert_experience"]
+        if scientific_profile_obj:
+            pi_data["scientific_profile"] = scientific_profile_obj
+        if scientific_profile_fields.get("total_publications"):
+            pi_data["total_publications"] = scientific_profile_fields["total_publications"]
+        if scientific_profile_fields.get("h_index_scopus"):
+            pi_data["h_index_scopus"] = scientific_profile_fields["h_index_scopus"]
+        if scientific_profile_fields.get("q1_q2_publications_10years"):
+            q = scientific_profile_fields["q1_q2_publications_10years"]
+            q_nums = re.findall(r"\d+", q)
+            if q_nums and scientific_profile_obj.get("metrics"):
+                scientific_profile_obj["metrics"]["q1_q2_publications_10years"] = q_nums[-1]
+        if scientific_profile_fields.get("total_grants"):
+            grants = scientific_profile_fields["total_grants"]
+            if not re.search(r"\d", grants) or re.search(r"зокрема\s+гранти", grants, re.IGNORECASE):
+                if scientific_profile_obj.get("metrics"):
+                    scientific_profile_obj["metrics"].pop("total_grants", None)
+
+        orcid_norm, orcid_raw = SemanticValidator.normalize_orcid(f"{personal_text} {scientific_profile_text}")
+        if orcid_norm:
+            pi_data["orcid"] = orcid_norm
+            pi_data["orcid_raw"] = orcid_norm
+
+        activity_text = " ".join(sections["scientific_activity"])
+        activity_fields = _extract_labeled_values(
+            activity_text,
+            {
+                "scientific_direction": [r"науковий\s+напрям"],
+                "science_branch": [r"галузь\s+науки"],
+                "publications_in_expertise": [r"кількість\s+публікацій\s+за\s+галуззю"],
+                "keywords": [r"ключові\s+слова"],
+            },
+        )
+        if activity_fields:
+            scientific_activity: Dict[str, Any] = {}
+            if activity_fields.get("scientific_direction"):
+                scientific_activity["scientific_direction"] = activity_fields["scientific_direction"]
+            if activity_fields.get("science_branch"):
+                scientific_activity["science_branch"] = activity_fields["science_branch"]
+            if activity_fields.get("publications_in_expertise"):
+                pub_exp = activity_fields["publications_in_expertise"]
+                nums = re.findall(r"\d+", pub_exp)
+                scientific_activity["publications_in_expertise"] = nums[-1] if nums else pub_exp
+            if activity_fields.get("keywords"):
+                keywords = [
+                    _clean_value(x) for x in re.split(r"[;,]", activity_fields["keywords"]) if _clean_value(x)
+                ]
+                scientific_activity["keywords"] = keywords if len(keywords) > 1 else activity_fields["keywords"]
+            if scientific_activity:
+                pi_data["scientific_activity"] = scientific_activity
+
+        publications_list = _extract_list_items(sections["publications"])
+        if publications_list:
+            pi_data["publications_list"] = publications_list
+
+        monographs_patents = _extract_typed_monograph_items(sections["monographs_patents"])
+        if monographs_patents:
+            pi_data["monographs_patents"] = monographs_patents
+
+        edu_label_patterns = {
+            "institution_name": [r"навчальн\w*\s+заклад", r"місце\s+навчання", r"заклад\s+освіт"],
+            "country": [r"країна"],
+            "city": [r"місто"],
+            "faculty": [r"факультет"],
+            "speciality": [r"спеціальність"],
+            "diploma_number": [r"номер\s+диплому"],
+            "diploma_issue_date": [r"дата\s+видачі\s+диплому"],
+        }
+        education_fields = _extract_subsection_fields(
+            sections["education"],
+            edu_label_patterns,
+            multiline_fields={"speciality", "institution_name"},
+        )
+        if education_fields or sections["education"]:
+            education_item: Dict[str, Any] = dict(education_fields)
+            inferred_edu_inst = _infer_institution_name(sections["education"], edu_label_patterns)
+            if inferred_edu_inst and not education_item.get("institution_name"):
+                education_item["institution_name"] = inferred_edu_inst
+
+            speciality = education_item.get("speciality")
+            if speciality:
+                spec_match = re.search(
+                    r"^(?P<spec>.+?)\s+(?P<inst>[А-ЯA-ZІЇЄҐ][^,]{6,}(?:інститут|університет|академ[^,]*)[^,]*)(?:,\s*(?P<period>\d{4}\s*[-–]\s*\d{4}))?$",
+                    speciality,
+                    re.IGNORECASE,
+                )
+                if spec_match:
+                    education_item["speciality"] = _clean_value(spec_match.group("spec"))
+                    if not education_item.get("institution_name"):
+                        education_item["institution_name"] = _clean_value(spec_match.group("inst"))
+                    if spec_match.group("period"):
+                        education_item["study_period"] = _clean_value(spec_match.group("period"))
+                else:
+                    education_item["speciality"] = _clean_value(speciality)
+
+            if education_item.get("country") in {"У", "у"}:
+                education_item["country"] = "Україна"
+            if education_item.get("country") in {"У", "у"}:
+                education_item.pop("country", None)
+            if not education_item.get("country") and pi_data.get("country_of_residence"):
+                education_item["country"] = pi_data.get("country_of_residence")
+
+            if education_item:
+                pi_data["education"] = [education_item]
+
+        work_label_patterns = {
+            "institution_name": [r"місце\s+роботи(?:\s+та\s+посада)?", r"установа\s+де\s+працює"],
+            "position": [r"посада"],
+            "period": [r"період\s+роботи"],
+            "subordination": [r"підпорядкован"],
+            "edrpou": [r"єдрпоу"],
+            "country": [r"країна"],
+            "city": [r"місто"],
+            "address": [r"адреса\s+установи", r"адреса"],
+            "work_phone": [r"робочий\s+телефон", r"телефон"],
+        }
+        workplace_fields = _extract_subsection_fields(
+            sections["workplaces"],
+            work_label_patterns,
+            multiline_fields={"institution_name", "address", "subordination"},
+        )
+        if workplace_fields or sections["workplaces"]:
+            workplace_item: Dict[str, Any] = dict(workplace_fields)
+            inferred_work_inst = _infer_institution_name(sections["workplaces"], work_label_patterns)
+            if inferred_work_inst and not workplace_item.get("institution_name"):
+                workplace_item["institution_name"] = inferred_work_inst
+
+            sub = workplace_item.get("subordination")
+            if sub:
+                sub = _clean_value(sub)
+                sub = re.sub(r"^[iі]?\s*сть\s+", "", sub, flags=re.IGNORECASE)
+                sub = re.sub(r"^[^\s]{0,6}ість\s+", "", sub, flags=re.IGNORECASE)
+                workplace_item["subordination"] = sub
+
+            if workplace_item.get("country") in {"У", "у"}:
+                workplace_item["country"] = "Україна"
+            if workplace_item.get("country") in {"У", "у"}:
+                workplace_item.pop("country", None)
+            if workplace_item.get("country") and re.fullmatch(r"\d{4,}", workplace_item["country"]):
+                workplace_item.pop("country", None)
+            if not workplace_item.get("country") and any("укра" in ln.lower() for ln in sections["workplaces"]):
+                workplace_item["country"] = "Україна"
+
+            if workplace_item.get("address"):
+                addr = _clean_value(workplace_item["address"])
+                addr = re.sub(r"^установи\b[:\s\-]*", "", addr, flags=re.IGNORECASE).strip()
+                workplace_item["address"] = addr
+            if not workplace_item.get("address") or len(workplace_item.get("address", "")) < 10:
+                addr_candidates = [
+                    _clean_value(ln)
+                    for ln in sections["workplaces"]
+                    if re.search(r"просп|вул\.?|вулиц|київ|буд\.?|адрес", ln, re.IGNORECASE)
+                    and not re.search(r"^адреса\s+установи\b", ln, re.IGNORECASE)
+                ]
+                if addr_candidates:
+                    workplace_item["address"] = max(addr_candidates, key=len)
+
+            if workplace_item.get("work_phone"):
+                norm_work_phone = _normalize_ua_phone(workplace_item["work_phone"])
+                if norm_work_phone:
+                    workplace_item["work_phone"] = norm_work_phone
+
+            if workplace_item:
+                pi_data["workplaces"] = [workplace_item]
+                if workplace_item.get("position"):
+                    pi_data["position"] = workplace_item["position"]
+        if not pi_data.get("position"):
+            for line in sections["workplaces"]:
+                m = re.search(r"\bпосада\s*[:\-]?\s*(.+)$", line, re.IGNORECASE)
+                if m:
+                    pi_data["position"] = _clean_value(m.group(1))
+                    break
+
+        degree_lines = sections["scientific_degree"]
+        degree_text = " ".join(degree_lines)
+        degree_fields = _extract_labeled_values(
+            degree_text,
+            {
+                "diploma_number": [r"номер\s+диплому"],
+                "diploma_issue_date": [r"дата\s+видачі\s+диплому"],
+            },
+        )
+        degree_name = ""
+        for line in degree_lines:
+            if re.search(r"номер\s+диплому|дата\s+видачі", line, re.IGNORECASE):
                 continue
+            if line:
+                degree_name = line
+                break
+        if not degree_name:
+            m = re.search(r"науковий\s+ступінь\s*[:\-]?\s*(.+)$", degree_text, re.IGNORECASE)
+            if m:
+                degree_name = _clean_value(m.group(1))
+        if degree_name or degree_fields:
+            scientific_degree: Dict[str, Any] = {}
+            if degree_name:
+                scientific_degree["name"] = degree_name
+            scientific_degree.update(degree_fields)
+            pi_data["scientific_degree"] = scientific_degree
+            if degree_name:
+                pi_data["degree_raw"] = degree_name
+                if not pi_data.get("degree"):
+                    pi_data["degree"] = degree_name
 
-            low = norm_value.lower()
-            if low in forbidden_values:
-                continue
+        academic_titles = _extract_academic_titles(sections["academic_titles"])
+        if academic_titles:
+            pi_data["academic_titles"] = academic_titles
 
-            if field == "orcid":
-                norm_orcid, raw_orcid = SemanticValidator.normalize_orcid(norm_value)
-                if norm_orcid:
-                    pi_data["orcid"] = norm_orcid
-                    pi_data["orcid_raw"] = norm_orcid
-            elif field == "phone":
-                norm_value = _truncate_after_markers(norm_value, [r"\bE-?mail\b", r"\bЕлектронна\s+пошта\b", r"\bПерсональна\s+інтернет-сторінка\b"])
-                if SemanticValidator.is_phone(norm_value):
-                    pi_data[field] = norm_value
-            elif field == "email":
-                norm_value = _truncate_after_markers(norm_value, [r"\bПерсональна\s+інтернет-сторінка\b", r"\bORCID\b", r"\bМобільний\s+телефон\b"])
-                if SemanticValidator.is_email(norm_value):
-                    pi_data[field] = norm_value
-            elif field == "citizenship":
-                norm_value = _truncate_after_markers(norm_value, [r"\bМобільний\s+телефон\b", r"\bЕлектронна\s+пошта\b", r"\bПосада\b"])
-                if SemanticValidator.is_citizenship(norm_value):
-                    pi_data[field] = norm_value
-            elif field == "position":
-                # Reject obvious label noise in position value.
-                norm_value = _truncate_after_markers(norm_value, [r"\bМобільний\s+телефон\b", r"\bЕлектронна\s+пошта\b", r"\bПерсональна\s+інтернет-сторінка\b"])
-                if not any(kw in low for kw in ["телефон", "пошта", "громадянство"]):
-                    pi_data[field] = norm_value
+        appendix_lines = sections["appendix_visual_proof"]
+        appendix_text = " ".join(appendix_lines)
+        if pi_data.get("scientific_degree") and isinstance(pi_data["scientific_degree"], dict):
+            degree_obj = pi_data["scientific_degree"]
+            selected_diploma_start: Optional[int] = None
+            selected_diploma_end: Optional[int] = None
+            if not degree_obj.get("diploma_number"):
+                diploma_candidates = []
+                for m in re.finditer(r"(?:ДД|ДК)\s*№\s*\d{4,8}", appendix_text, re.IGNORECASE):
+                    ctx = appendix_text[max(0, m.start() - 160): m.end() + 120]
+                    score = 2 if re.search(r"доктор|наук", ctx, re.IGNORECASE) else 1
+                    diploma_candidates.append((score, m.start(), m.end(), m.group(0).replace(" ", "")))
+                if diploma_candidates:
+                    diploma_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                    selected_diploma_start = diploma_candidates[0][1]
+                    selected_diploma_end = diploma_candidates[0][2]
+                    degree_obj["diploma_number"] = diploma_candidates[0][3]
             else:
-                pi_data[field] = norm_value
-        
-        if not pi_data.get("degree") and pi_data.get("degree_raw"):
-            pi_data["degree"] = pi_data["degree_raw"]
+                diploma_pattern = re.escape(degree_obj["diploma_number"]).replace("\\№", r"\s*№\s*")
+                m = re.search(diploma_pattern, appendix_text, re.IGNORECASE)
+                if m:
+                    selected_diploma_start = m.start()
+                    selected_diploma_end = m.end()
+            if not degree_obj.get("diploma_issue_date"):
+                if selected_diploma_start is not None:
+                    tail_from_diploma = appendix_text[selected_diploma_end or selected_diploma_start:]
+                    nearby_after = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", tail_from_diploma)
+                    if nearby_after and nearby_after.start() <= 120:
+                        degree_obj["diploma_issue_date"] = nearby_after.group(0)
+                if not degree_obj.get("diploma_issue_date"):
+                    date_candidates = []
+                    for m in re.finditer(r"\b\d{2}\.\d{2}\.\d{4}\b", appendix_text):
+                        ctx = appendix_text[max(0, m.start() - 180): m.end() + 120]
+                        score = 1
+                        if re.search(r"дата\s+видачі\s+диплому|дата\s+видачі", ctx, re.IGNORECASE):
+                            score += 4
+                        if re.search(r"доктор|наук|дд\s*№|дк\s*№", ctx, re.IGNORECASE):
+                            score += 2
+                        distance = 10_000
+                        if selected_diploma_start is not None:
+                            distance = abs(m.start() - selected_diploma_start)
+                            if distance <= 160:
+                                score += 3
+                            elif distance <= 300:
+                                score += 1
+                        date_candidates.append((score, -distance, m.start(), m.group(0)))
+                    if date_candidates:
+                        date_candidates.sort(reverse=True)
+                        degree_obj["diploma_issue_date"] = date_candidates[0][3]
+        visual_markers = ["сертифікат", "диплом", "довідка", "додаток", "certificate", "diploma", "curriculum vitae", "cv"]
+        appendix_hits = [
+            line for line in appendix_lines
+            if any(marker in line.lower() for marker in visual_markers)
+        ]
+        if appendix_lines:
+            pi_data["cv_appendix"] = {
+                "detected": True,
+                "line_count": len(appendix_lines),
+                "preview_lines": appendix_lines[:20],
+                "residual_text": " ".join(appendix_lines),
+            }
+        if appendix_hits:
+            pi_data["visual_proof"] = {
+                "possible_scanned_appendix": True,
+                "supporting_phrases": appendix_hits[:5],
+                "handling_note": "Structured CV/profile text parsed locally; appendix pages can be external-fallback candidates later.",
+            }
+        pi_data["structured_profile_local_parse"] = True
 
         structure.metadata["pi_profile"] = pi_data
 
@@ -1261,41 +3678,10 @@ class PdfParsingService:
             zone.blocks = [b for b in zone.blocks if b.block_type != "profile_block" or b == main_block]
 
     def _extract_team_profiles(self, zone: DocumentZone, pages: List[str], structure: ParsedDocumentStructure):
-        """Extract co-author list from Zone 6 and flatten into individual profile entities."""
-        if not structure.metadata: structure.metadata = {}
-        team = []
-        seen_names = set()
-        seen_orcids: Dict[str, int] = {}
-        seen_name_companion: Dict[Tuple[str, str], int] = {}
-        seen_short_companion: Dict[Tuple[str, str], int] = {}
-        
-        # We need to collect ALL profile information and then deduplicate
-        all_text = "\n".join([b.text for b in zone.blocks])
-        
-        # Detect individual profile entries
-        # Profiles usually start with "Пан" or "Пані" or "Професор" or "Доктор" or a name in Zone 6
-        split_pattern = r"(?=(?:Пан|Пані|Професор|Доктор|К\.т\.н\.|Д\.т\.н\.|Ph\.D\.)\s+[А-ЯЄІЇҐ][а-яєіїґ']+\s+[А-ЯЄІЇҐ][а-яєіїґ']+)"
-        profile_splits = re.split(split_pattern, all_text)
-        
-        # Count potential profile starts for completeness check
-        detected_starts = len(re.findall(split_pattern, all_text))
-        unresolved_starts = []
-        unresolved_pages = []
-        
-        # Track pages for unresolved starts
-        current_char = 0
-        for m in re.finditer(split_pattern, all_text):
-            start_pos = m.start()
-            # Find page number for this position
-            p_num = zone.page_start
-            char_acc = 0
-            for b in zone.blocks:
-                char_acc += len(b.text) + 1
-                if char_acc > start_pos:
-                    p_num = b.page_number
-                    break
-            # We'll use this later to find unresolved ones
-            
+        """Extract Zone 6 co-authors as repeated Zone 5-like records with explicit ownership."""
+        if not structure.metadata:
+            structure.metadata = {}
+
         def _normalize_identity_text(value: Optional[str]) -> str:
             if not value:
                 return ""
@@ -1304,226 +3690,174 @@ class PdfParsingService:
             normalized = re.sub(r"[^\w\s\-']", "", normalized)
             return normalized
 
-        def _short_name_signature(name_value: str) -> str:
-            parts = [p for p in name_value.split() if p]
-            if len(parts) < 2:
-                return ""
-            surname = parts[0]
-            initials = "".join(p[0] for p in parts[1:] if p and p[0].isalpha())
-            return f"{surname} {initials}".strip()
+        def _extract_start_name(line: str) -> Optional[str]:
+            clean_line = re.sub(r"\s+", " ", (line or "").strip())
+            if not clean_line:
+                return None
+            non_name_tokens = {
+                "кафедри", "технічних", "наук", "доктор", "професор", "старший",
+                "науковий", "співробітник", "інститут", "академії", "академія",
+                "університет", "університету", "відділу", "посада", "місце", "роботи",
+            }
+            # Strong start anchor: honorific/title + full person name.
+            m = re.search(
+                r"^(?:Пан|Пані|Професор|Доктор|К\.т\.н\.|Д\.т\.н\.|Ph\.D\.)\s+"
+                r"([А-ЯЄІЇҐ][а-яєіїґ'`-]+\s+[А-ЯЄІЇҐ][а-яєіїґ'`-]+(?:\s+[А-ЯЄІЇҐ][а-яєіїґ'`-]+)?)",
+                clean_line,
+                re.IGNORECASE,
+            )
+            if not m:
+                return None
+            full = clean_line[: m.end()]
+            name, _, _ = SemanticValidator.clean_name_and_get_titles(full)
+            name_tokens = [t.lower() for t in name.split() if t]
+            if (
+                name
+                and len(name_tokens) >= 2
+                and not any(tok in non_name_tokens for tok in name_tokens)
+            ):
+                return name
+            return None
 
-        def _extract_entry_fields(entry_text: str) -> Dict[str, str]:
-            entry_lines = [re.sub(r"\s+", " ", l.strip()) for l in entry_text.split("\n") if l.strip()]
-            specs = [
-                ("orcid", r"ORCID"),
-                ("degree_raw", r"Науковий\s+ступінь"),
-                ("position", r"Посада"),
-                ("institution", r"Місце\s+роботи"),
-            ]
-            compiled = [(f, re.compile(r"^" + p + r"\s*:?\s*(.*)$", re.IGNORECASE)) for f, p in specs]
-            any_label = re.compile(r"^(?:" + "|".join(["(?:%s)" % p for _, p in specs]) + r")\b", re.IGNORECASE)
-            extracted: Dict[str, str] = {}
-
-            for i, line in enumerate(entry_lines):
-                for field, cre in compiled:
-                    if field in extracted:
-                        continue
-                    m = cre.match(line)
-                    if not m:
-                        continue
-                    values: List[str] = []
-                    inline = (m.group(1) or "").strip()
-                    if inline:
-                        values.append(inline)
-                    for j in range(i + 1, min(len(entry_lines), i + 4)):
-                        nxt = entry_lines[j]
-                        if any_label.search(nxt):
-                            break
-                        if nxt.isupper() and len(nxt.split()) <= 5:
-                            break
-                        values.append(nxt)
-                        if len(values) >= 2:
-                            break
-                    value = re.sub(r"\s+", " ", " ".join(values)).strip()
-                    value = re.sub(r"^\-\s*", "", value).strip()
-                    if value:
-                        extracted[field] = value
-            return extracted
-
-        def _trim_tail(value: str, patterns: List[str]) -> str:
-            if not value:
-                return value
-            out = value
-            for pat in patterns:
-                out = re.sub(pat + r".*$", "", out, flags=re.IGNORECASE).strip()
-            return out
-
-        def _looks_like_label_noise(value: str) -> bool:
-            low = value.strip().lower()
-            if not low:
-                return True
-            if low in {"та посада", "orcid", "місце роботи", "науковий ступінь", "посада", "період роботи"}:
-                return True
-            if "мінімум два" in low or "google scholar" in low or "scopus authors" in low:
-                return True
-            return False
-
-        def _is_institution_value(value: str) -> bool:
-            if not value or _looks_like_label_noise(value):
-                return False
-            normalized = re.sub(r"^\s*та\s+посада\b[:\s\-]*", "", value, flags=re.IGNORECASE).strip()
-            low = normalized.lower()
-            inst_markers = ["університет", "інститут", "академ", "нац", "нан україни", "україни"]
-            return any(m in low for m in inst_markers)
-
-        def _is_position_value(value: str) -> bool:
-            if not value or _looks_like_label_noise(value):
-                return False
-            low = value.lower()
-            bad_markers = ["google scholar", "scopus", "orcid", "мінімум два", "та посада"]
-            if any(m in low for m in bad_markers):
-                return False
-            # Position is usually role-like, not institution name.
-            if _is_institution_value(value):
-                return False
-            return True
-
-        for entry in profile_splits:
-            if not entry.strip(): continue
-            
-            # Extract name
-            name_match = re.search(r"(?:Пан|Пані|Професор|Доктор|К\.т\.н\.|Д\.т\.н\.|Ph\.D\.)\s+([А-ЯЄІЇҐ][а-яєіїґ]+\s+[А-ЯЄІЇҐ][а-яєіїґ]+\s*[А-ЯЄІЇҐ]?[а-яєіїґ]*)", entry)
-            if not name_match:
-                # Fallback for names without honorifics - look for Uppercase Word + Uppercase Word
-                name_match = re.search(r"^([А-ЯЄІЇҐ][а-яєіїґ]+\s+[А-ЯЄІЇҐ][а-яєіїґ]+(?:\s+[А-ЯЄІЇҐ][а-яєіїґ]+)?)", entry.strip())
-            
-            if name_match:
-                raw_name = name_match.group(1).strip()
-                name, title, degree = SemanticValidator.clean_name_and_get_titles(name_match.group(0))
-                norm_name = _normalize_identity_text(name)
-                
-                if 5 < len(name) < 100:
-                    # Extract other fields for this person if possible
-                    person_data = {
-                        "name": name,
-                        "title": title,
-                        "degree": degree
+        line_items: List[Dict[str, Any]] = []
+        for b_idx, block in enumerate(zone.blocks):
+            if not block.text:
+                continue
+            for raw_line in block.text.split("\n"):
+                clean_line = re.sub(r"\s+", " ", raw_line.strip())
+                if not clean_line:
+                    continue
+                line_items.append(
+                    {
+                        "text": clean_line,
+                        "page_number": block.page_number or zone.page_start,
+                        "block_index": b_idx,
                     }
+                )
 
-                    extracted = _extract_entry_fields(entry)
-                    orcid_val = extracted.get("orcid")
-                    if orcid_val:
-                        norm_orcid, raw_orcid = SemanticValidator.normalize_orcid(orcid_val)
-                        if norm_orcid:
-                            person_data["orcid"] = norm_orcid
-                            person_data["orcid_raw"] = norm_orcid
-                        else:
-                            person_data["orcid"] = None
-                            person_data["orcid_raw"] = None
+        starts: List[Tuple[int, str]] = []
+        for idx, item in enumerate(line_items):
+            start_name = _extract_start_name(item["text"])
+            if start_name:
+                starts.append((idx, start_name))
 
-                    degree_raw = extracted.get("degree_raw")
-                    if degree_raw and not _looks_like_label_noise(degree_raw):
-                        person_data["degree_raw"] = degree_raw
+        records: List[Dict[str, Any]] = []
+        for i, (start_idx, start_name) in enumerate(starts):
+            end_idx = starts[i + 1][0] if i + 1 < len(starts) else len(line_items)
+            seg_lines = line_items[start_idx:end_idx]
+            if not seg_lines:
+                continue
+            seg_text = "\n".join(li["text"] for li in seg_lines)
+            seg_pages = sorted({int(li["page_number"]) for li in seg_lines if li.get("page_number")})
+            seg_blocks = sorted({int(li["block_index"]) for li in seg_lines if li.get("block_index") is not None})
+            records.append(
+                {
+                    "name_hint": start_name,
+                    "text": seg_text,
+                    "pages": seg_pages,
+                    "block_indices": seg_blocks,
+                    "start_anchor": seg_lines[0]["text"],
+                }
+            )
 
-                    position_val = extracted.get("position")
-                    institution_val = extracted.get("institution")
-                    if position_val:
-                        position_val = _trim_tail(position_val, [r"\bПеріод\s+роботи\b", r"\bМісце\s+роботи\b", r"\bORCID\b"])
-                    if institution_val:
-                        institution_val = re.sub(r"^\s*ТА\s+ПОСАДА\b[:\s\-]*", "", institution_val, flags=re.IGNORECASE).strip()
-                        institution_val = _trim_tail(institution_val, [r"\bПеріод\s+роботи\b", r"\bПосада\b", r"\bORCID\b"])
+        team: List[Dict[str, Any]] = []
+        seen_orcids: Dict[str, int] = {}
+        seen_names: Dict[str, int] = {}
 
-                    # Conservative anti-bleed assignment.
-                    if position_val and _is_position_value(position_val):
-                        person_data["position"] = position_val
-                    if institution_val and _is_institution_value(institution_val):
-                        person_data["institution"] = institution_val
+        for rec in records:
+            tmp_zone = DocumentZone(
+                name="Zone 6 — Co-author Record",
+                zone_type="pi_profile",
+                page_start=rec["pages"][0] if rec["pages"] else zone.page_start,
+                page_end=rec["pages"][-1] if rec["pages"] else zone.page_start,
+                sections=[],
+                blocks=[
+                    DocumentBlock(
+                        block_type="profile_block",
+                        text=rec["text"],
+                        page_number=rec["pages"][0] if rec["pages"] else zone.page_start,
+                        metadata={},
+                    )
+                ],
+            )
+            tmp_structure = ParsedDocumentStructure(
+                pi_name=rec["name_hint"],
+                zones=[tmp_zone],
+                sections=[],
+                markers={},
+                metadata={},
+                tables=[],
+                page_table_classifications=[],
+            )
+            self._extract_pi_profile(tmp_zone, pages, tmp_structure)
+            profile = (tmp_structure.metadata or {}).get("pi_profile") or {}
+            if not profile.get("name"):
+                profile["name"] = rec["name_hint"]
 
-                    # Swap/fix if values landed in opposite field.
-                    if not person_data.get("institution") and position_val and _is_institution_value(position_val):
-                        person_data["institution"] = position_val
-                    if not person_data.get("position") and institution_val and _is_position_value(institution_val):
-                        person_data["position"] = institution_val
-                    
-                    # Ensure degree is populated if found in labels but not in name
-                    if not person_data.get("degree") and person_data.get("degree_raw"):
-                        person_data["degree"] = person_data["degree_raw"]
+            ownership = {
+                "start_anchor": rec["start_anchor"],
+                "pages": rec["pages"],
+                "page_start": rec["pages"][0] if rec["pages"] else None,
+                "page_end": rec["pages"][-1] if rec["pages"] else None,
+                "source_block_count": len(rec["block_indices"]),
+            }
+            profile["record_ownership"] = ownership
+            if isinstance(profile.get("cv_appendix"), dict):
+                profile["cv_appendix"]["owner_pages"] = rec["pages"]
 
-                    orcid_norm = _normalize_identity_text(person_data.get("orcid"))
-                    companion_parts = [
-                        _normalize_identity_text(person_data.get("position")),
-                        _normalize_identity_text(person_data.get("degree")),
-                        _normalize_identity_text(person_data.get("institution")),
-                    ]
-                    companion_key = "|".join([p for p in companion_parts if p])
-                    short_name = _short_name_signature(norm_name)
+            key_orcid = _normalize_identity_text(profile.get("orcid"))
+            key_name = _normalize_identity_text(profile.get("name"))
+            duplicate_idx: Optional[int] = None
+            if key_orcid and key_orcid in seen_orcids:
+                duplicate_idx = seen_orcids[key_orcid]
+            elif key_name and key_name in seen_names:
+                duplicate_idx = seen_names[key_name]
 
-                    duplicate_idx = None
-                    if orcid_norm and orcid_norm in seen_orcids:
-                        duplicate_idx = seen_orcids[orcid_norm]
-                    elif companion_key and (norm_name, companion_key) in seen_name_companion:
-                        duplicate_idx = seen_name_companion[(norm_name, companion_key)]
-                    elif companion_key and short_name and (short_name, companion_key) in seen_short_companion:
-                        # Conservative variant merge: same companion fields + same surname/initials signature.
-                        duplicate_idx = seen_short_companion[(short_name, companion_key)]
-                    elif norm_name in seen_names:
-                        duplicate_idx = next(
-                            (idx for idx, existing in enumerate(team)
-                             if _normalize_identity_text(existing.get("name")) == norm_name),
-                            None
-                        )
-
-                    if duplicate_idx is None:
-                        team.append(person_data)
-                        idx = len(team) - 1
-                        seen_names.add(norm_name)
-                        if orcid_norm:
-                            seen_orcids[orcid_norm] = idx
-                        if companion_key:
-                            seen_name_companion[(norm_name, companion_key)] = idx
-                            if short_name:
-                                seen_short_companion[(short_name, companion_key)] = idx
-                    else:
-                        # Merge missing deterministic fields into the existing canonical profile.
-                        existing = team[duplicate_idx]
-                        for field_name, field_value in person_data.items():
-                            if field_value and not existing.get(field_name):
-                                existing[field_name] = field_value
-                else:
-                    # Could be a duplicate or invalid name
-                    pass
+            if duplicate_idx is None:
+                team.append(profile)
+                idx = len(team) - 1
+                if key_orcid:
+                    seen_orcids[key_orcid] = idx
+                if key_name:
+                    seen_names[key_name] = idx
             else:
-                # Unresolved start
-                unresolved_starts.append(entry[:50].strip())
-                # Find page for this entry if possible
-                
+                existing = team[duplicate_idx]
+                for field_name, field_value in profile.items():
+                    if field_value and not existing.get(field_name):
+                        existing[field_name] = field_value
+                if existing.get("record_ownership") and profile.get("record_ownership"):
+                    existing_pages = set(existing["record_ownership"].get("pages") or [])
+                    incoming_pages = set(profile["record_ownership"].get("pages") or [])
+                    merged_pages = sorted(existing_pages | incoming_pages)
+                    existing["record_ownership"]["pages"] = merged_pages
+                    if merged_pages:
+                        existing["record_ownership"]["page_start"] = merged_pages[0]
+                        existing["record_ownership"]["page_end"] = merged_pages[-1]
+                    existing["record_ownership"]["source_block_count"] = (
+                        int(existing["record_ownership"].get("source_block_count") or 0)
+                        + int(profile["record_ownership"].get("source_block_count") or 0)
+                    )
+
         structure.metadata["team_profiles"] = team
         structure.metadata["team_profile_completeness"] = {
-            "detected_starts": detected_starts,
+            "detected_starts": len(starts),
             "extracted_entities": len(team),
-            "unresolved_starts": unresolved_starts,
-            "unresolved_pages": list(set(unresolved_pages))
+            "unresolved_starts": [],
+            "unresolved_pages": [],
         }
 
-        # RECONSTRUCT BLOCKS: One profile_block per person
-        new_blocks = []
-        # Keep non-profile blocks
-        for b in zone.blocks:
-            if b.block_type != "profile_block":
-                new_blocks.append(b)
-        
-        # Add exactly one profile_block per person
+        new_blocks = [b for b in zone.blocks if b.block_type != "profile_block"]
         for person in team:
-            # Deterministic ID for profile blocks to ensure they aren't duplicated by mistake
-            new_blocks.append(DocumentBlock(
-                block_type="profile_block",
-                text="[STRUCTURED DATA]",
-                metadata=person,
-                page_number=zone.page_start,
-                # Use name in text to make it unique for deduplication tests if needed
-                # although metadata is already there.
-            ))
-            
+            ownership = person.get("record_ownership") or {}
+            page_num = ownership.get("page_start") or zone.page_start
+            new_blocks.append(
+                DocumentBlock(
+                    block_type="profile_block",
+                    text="[STRUCTURED DATA]",
+                    metadata=person,
+                    page_number=page_num,
+                )
+            )
         zone.blocks = new_blocks
 
     def _detect_annex_subtypes(self, zone: DocumentZone, pages: List[str], structure: ParsedDocumentStructure):
@@ -1645,6 +3979,159 @@ class PdfParsingService:
             filename = f"parsing_debug_{os.getpid()}.json"
         with open(os.path.join(debug_dir, filename), "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
+
+    def _collect_parser_feature_flags(self) -> Dict[str, Any]:
+        flags = {
+            "DEBUG_PARSING": os.getenv("DEBUG_PARSING") == "true",
+            "USE_LITEPARSE_ENRICHMENT": settings.USE_LITEPARSE_ENRICHMENT,
+            "USE_LITEPARSE_SCANNED_TABLE_ROUTING": settings.USE_LITEPARSE_SCANNED_TABLE_ROUTING,
+            "USE_SCANNED_CERT_VISION_EVIDENCE": settings.USE_SCANNED_CERT_VISION_EVIDENCE,
+            "LITEPARSE_OCR_ENABLED": settings.LITEPARSE_OCR_ENABLED,
+            "LITEPARSE_OCR_ENGINE": settings.LITEPARSE_OCR_ENGINE,
+            "LITEPARSE_SCREENSHOT_ENABLED": settings.LITEPARSE_SCREENSHOT_ENABLED,
+            "LITEPARSE_USE_CLI": settings.LITEPARSE_USE_CLI,
+            "LITEPARSE_CLI_PATH_SETTING": settings.LITEPARSE_CLI_PATH,
+        }
+        try:
+            flags.update(self.enrichment_service.get_runtime_info())
+        except Exception:
+            pass
+        return flags
+
+    def _build_canonical_debug_artifact(
+        self,
+        parsing_result: Dict[str, Any],
+        input_file_name: Optional[str],
+        input_file_path: Optional[str],
+    ) -> Dict[str, Any]:
+        timestamp_utc = datetime.now(timezone.utc)
+        run_id = f"parse_{timestamp_utc.strftime('%Y%m%dT%H%M%SZ')}_{uuid4().hex[:8]}"
+
+        return {
+            "run_id": run_id,
+            "timestamp_utc": timestamp_utc.isoformat().replace("+00:00", "Z"),
+            "input": {
+                "file_name": input_file_name or "unknown",
+                "file_path": input_file_path,
+            },
+            "feature_flags": self._collect_parser_feature_flags(),
+            "parsing_result": parsing_result,
+        }
+
+    def _build_page_inspection_summary(
+        self,
+        structure: ParsedDocumentStructure,
+    ) -> Dict[str, Any]:
+        def _collect_section_blocks(sec: DocumentSection, collector: List[DocumentBlock]) -> None:
+            collector.extend(sec.blocks)
+            for sub in sec.subsections:
+                _collect_section_blocks(sub, collector)
+
+        page_zone: Dict[int, str] = {}
+        for z in structure.zones:
+            for p in range(z.page_start, (z.page_end or z.page_start) + 1):
+                if p not in page_zone:
+                    page_zone[p] = z.zone_type
+
+        page_blocks: Dict[int, int] = {}
+        for z in structure.zones:
+            all_blocks: List[DocumentBlock] = []
+            all_blocks.extend(z.blocks)
+            for sec in z.sections:
+                _collect_section_blocks(sec, all_blocks)
+            for b in all_blocks:
+                if not b.page_number:
+                    continue
+                page_blocks[b.page_number] = page_blocks.get(b.page_number, 0) + 1
+
+        page_tables: Dict[int, Dict[str, Any]] = {}
+        for t in structure.tables:
+            start = t.page_start or 0
+            end = t.page_end or start
+            for p in range(start, end + 1):
+                slot = page_tables.setdefault(p, {"table_families": [], "table_ids": []})
+                if t.table_family not in slot["table_families"]:
+                    slot["table_families"].append(t.table_family)
+                if t.table_id and t.table_id not in slot["table_ids"]:
+                    slot["table_ids"].append(t.table_id)
+
+        page_class: Dict[int, str] = {
+            c.page_number: c.page_class for c in structure.page_table_classifications
+        }
+        page_family_hint: Dict[int, Optional[str]] = {
+            c.page_number: (c.signals or {}).get("scanned_family_hint")
+            for c in structure.page_table_classifications
+        }
+        page_family_conf: Dict[int, Optional[float]] = {
+            c.page_number: (c.signals or {}).get("scanned_family_confidence")
+            for c in structure.page_table_classifications
+        }
+
+        all_pages: Set[int] = set(page_zone.keys()) | set(page_blocks.keys()) | set(page_tables.keys()) | set(page_class.keys())
+        rows: List[Dict[str, Any]] = []
+        for p in sorted(all_pages):
+            table_meta = page_tables.get(p, {"table_families": [], "table_ids": []})
+            rows.append({
+                "page_number": p,
+                "zone_type": page_zone.get(p),
+                "page_class": page_class.get(p),
+                "scanned_family_hint": page_family_hint.get(p),
+                "scanned_family_confidence": page_family_conf.get(p),
+                "block_count": page_blocks.get(p, 0),
+                "has_table_object": bool(table_meta["table_ids"]),
+                "table_families": sorted(table_meta["table_families"]),
+                "table_ids": sorted(table_meta["table_ids"]),
+            })
+
+        return {
+            "note": "Inspection aid only: scanned_image_only pages may still have canonical table objects.",
+            "rows": rows,
+        }
+
+    def _save_canonical_debug_artifact(self, artifact: Dict[str, Any]) -> str:
+        debug_dir = "debug/parsing"
+        runs_dir = os.path.join(debug_dir, "runs")
+        run_id = artifact["run_id"]
+        run_dir = os.path.join(runs_dir, run_id)
+        os.makedirs(run_dir, exist_ok=True)
+
+        parse_output_path = os.path.join(run_dir, "parse_output.json")
+        with open(parse_output_path, "w", encoding="utf-8") as f:
+            json.dump(artifact, f, ensure_ascii=False, indent=2)
+
+        page_inspection_summary_path = os.path.join(debug_dir, "page_inspection_summary.json")
+        run_page_inspection_summary_path = os.path.join(run_dir, "page_inspection_summary.json")
+        if os.path.exists(page_inspection_summary_path):
+            try:
+                with open(page_inspection_summary_path, "r", encoding="utf-8") as src:
+                    summary_obj = json.load(src)
+                with open(run_page_inspection_summary_path, "w", encoding="utf-8") as dst:
+                    json.dump(summary_obj, dst, ensure_ascii=False, indent=2)
+            except Exception:
+                run_page_inspection_summary_path = None
+        else:
+            run_page_inspection_summary_path = None
+
+        latest_run = {
+            "run_id": run_id,
+            "timestamp_utc": artifact["timestamp_utc"],
+            "parse_output_path": parse_output_path,
+            "input": artifact.get("input", {}),
+            "feature_flags": artifact.get("feature_flags", {}),
+            "legacy_artifacts": {
+                "debug_parse_output": os.path.join(debug_dir, "debug_parse_output.json"),
+                "normalized_structure": os.path.join(debug_dir, "normalized_structure.json"),
+                "page_inspection_summary": page_inspection_summary_path,
+            },
+            "run_artifacts": {
+                "page_inspection_summary": run_page_inspection_summary_path,
+            },
+        }
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(os.path.join(debug_dir, "latest_run.json"), "w", encoding="utf-8") as f:
+            json.dump(latest_run, f, ensure_ascii=False, indent=2)
+
+        return parse_output_path
 
     def _legacy_extract_all_sections(self, doc: fitz.Document, pages_text: List[str]) -> List[Dict[str, Any]]:
         """Legacy method to extract all sections from all pages."""

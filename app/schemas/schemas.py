@@ -223,6 +223,7 @@ class CanonicalTable(BaseModel):
     page_start: int
     page_end: int
     source: dict = {}
+    context: dict = {}
     columns: List[CanonicalTableColumn] = []
     rows: List[CanonicalTableRow] = []
     spans: List[dict] = []

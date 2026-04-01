@@ -1,9 +1,57 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import re
 from sqlalchemy.orm import Session, joinedload
 from app.models.models import SubmittedFile, Call, ApplicationPackage, ChecklistItem, ReportFinding, Report, CallDocument
 from app.core.logger import logger
 
 class ChecklistService:
+    APPLICATION_ID_PATTERN = re.compile(r"^\d{4}\.\d{2}/\d{4,}$")
+
+    @staticmethod
+    def _safe_structure(file_obj: SubmittedFile) -> Dict[str, Any]:
+        parsing_result = file_obj.parsing_result or {}
+        structure = parsing_result.get("structure") or {}
+        return structure if isinstance(structure, dict) else {}
+
+    @staticmethod
+    def _zones_by_type(structure: Dict[str, Any], zone_type: str) -> List[Dict[str, Any]]:
+        zones = structure.get("zones") or []
+        if not isinstance(zones, list):
+            return []
+        return [z for z in zones if isinstance(z, dict) and z.get("zone_type") == zone_type]
+
+    @staticmethod
+    def _table_families(file_obj: SubmittedFile) -> List[str]:
+        parsing_result = file_obj.parsing_result or {}
+        tables = parsing_result.get("tables") or []
+        if not isinstance(tables, list):
+            return []
+        families = []
+        for t in tables:
+            if isinstance(t, dict) and t.get("table_family"):
+                families.append(str(t.get("table_family")))
+        return families
+
+    @staticmethod
+    def _page_classes(file_obj: SubmittedFile) -> Dict[int, str]:
+        parsing_result = file_obj.parsing_result or {}
+        classes = parsing_result.get("page_table_classifications") or []
+        out: Dict[int, str] = {}
+        if not isinstance(classes, list):
+            return out
+        for c in classes:
+            if not isinstance(c, dict):
+                continue
+            p = c.get("page_number")
+            cls = c.get("page_class")
+            if isinstance(p, int) and isinstance(cls, str):
+                out[p] = cls
+        return out
+
+    @staticmethod
+    def _primary_file(files_by_lang: Dict[str, SubmittedFile], files: List[SubmittedFile]) -> Optional[SubmittedFile]:
+        return files_by_lang.get("uk") or (files[0] if files else None)
+
     def _get_sections_for_consumption(self, parsing_result: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Canonical section path: parsing_result["structure"]["zones"][*]["sections"].
@@ -305,6 +353,225 @@ class ChecklistService:
                     status = "pass"
                     explanation = "Bilingual consistency check skipped (single language submission)"
                     package_evidence = "Package only contains one language; no consistency check needed."
+
+            # Rule: HEADER_METADATA_PRESENCE
+            elif item.rule_code == "HEADER_METADATA_PRESENCE":
+                main_file = self._primary_file(files_by_lang, files)
+                if not main_file:
+                    status = "fail"
+                    explanation = "No files available for header metadata validation"
+                    package_evidence = "Package contains no files."
+                else:
+                    structure = self._safe_structure(main_file)
+                    header_zones = self._zones_by_type(structure, "header")
+                    call_title = (main_file.detected_call_title or "").strip()
+                    project_title = (main_file.detected_project_title or "").strip()
+                    pi_name = (structure.get("pi_name") or "").strip()
+
+                    present = {
+                        "detected_call_title": bool(call_title),
+                        "detected_project_title": bool(project_title),
+                        "structure.pi_name": bool(pi_name),
+                    }
+                    present_count = sum(1 for v in present.values() if v)
+
+                    header_pages = [
+                        f"{z.get('page_start')}-{z.get('page_end')}" for z in header_zones
+                    ] or ["n/a"]
+                    package_evidence = (
+                        f"Source: detected_call_title={present['detected_call_title']}, "
+                        f"detected_project_title={present['detected_project_title']}, "
+                        f"structure.pi_name={present['structure.pi_name']}, "
+                        f"header_zone_pages={','.join(header_pages)}"
+                    )
+
+                    if present_count == 3:
+                        status = "pass"
+                        explanation = "Header/package metadata fields are present"
+                    elif present_count == 0:
+                        status = "fail"
+                        explanation = "Required header/package metadata fields are missing"
+                    else:
+                        status = "review"
+                        missing = [k for k, v in present.items() if not v]
+                        explanation = f"Header/package metadata partially present; missing: {', '.join(missing)}"
+
+                    if header_zones:
+                        page_number = header_zones[0].get("page_start")
+
+            # Rule: APPLICATION_ID_CONSISTENCY
+            elif item.rule_code == "APPLICATION_ID_CONSISTENCY":
+                if not files:
+                    status = "fail"
+                    explanation = "No files available for application ID validation"
+                    package_evidence = "Package contains no files."
+                else:
+                    values = []
+                    evidence_parts = []
+                    missing_languages = []
+                    invalid_formats = []
+
+                    for f in files:
+                        structure = self._safe_structure(f)
+                        val = (
+                            (f.detected_project_registration_number or "").strip()
+                            or (structure.get("application_id") or "").strip()
+                        )
+                        evidence_parts.append(f"{f.language}:{val or 'MISSING'}")
+                        if val:
+                            values.append((f.language, val))
+                            if not self.APPLICATION_ID_PATTERN.match(val):
+                                invalid_formats.append(f"{f.language}:{val}")
+                        else:
+                            missing_languages.append(f.language)
+
+                    unique_values = sorted({v for _, v in values})
+                    package_evidence = (
+                        "Source: detected_project_registration_number/structure.application_id -> "
+                        + ", ".join(evidence_parts)
+                    )
+
+                    if missing_languages:
+                        status = "fail"
+                        explanation = f"Application ID missing for languages: {', '.join(missing_languages)}"
+                    elif invalid_formats:
+                        status = "fail"
+                        explanation = f"Application ID has invalid format: {', '.join(invalid_formats)}"
+                    elif len(unique_values) != 1:
+                        status = "fail"
+                        explanation = f"Application ID inconsistent across files: {', '.join(unique_values)}"
+                    else:
+                        status = "pass"
+                        explanation = "Application ID present, format-valid, and consistent"
+
+            # Rule: DESCRIPTION_STRUCTURE_PRESENCE
+            elif item.rule_code == "DESCRIPTION_STRUCTURE_PRESENCE":
+                main_file = self._primary_file(files_by_lang, files)
+                if not main_file:
+                    status = "fail"
+                    explanation = "No files available for description structure validation"
+                    package_evidence = "Package contains no files."
+                else:
+                    structure = self._safe_structure(main_file)
+                    description_zones = self._zones_by_type(structure, "description")
+                    sections_count = 0
+                    subsections_count = 0
+                    for zone in description_zones:
+                        zone_sections = zone.get("sections") or []
+                        if not isinstance(zone_sections, list):
+                            continue
+                        sections_count += len([s for s in zone_sections if isinstance(s, dict)])
+                        for sec in zone_sections:
+                            if isinstance(sec, dict):
+                                subs = sec.get("subsections") or []
+                                if isinstance(subs, list):
+                                    subsections_count += len([x for x in subs if isinstance(x, dict)])
+
+                    desc_pages = [
+                        f"{z.get('page_start')}-{z.get('page_end')}" for z in description_zones
+                    ] or ["n/a"]
+                    package_evidence = (
+                        f"Source: description_zones={len(description_zones)} "
+                        f"(pages {','.join(desc_pages)}), sections={sections_count}, subsections={subsections_count}"
+                    )
+
+                    if not description_zones or sections_count == 0:
+                        status = "fail"
+                        explanation = "Required description structure is missing"
+                    elif subsections_count == 0:
+                        status = "review"
+                        explanation = "Description structure found but subsection granularity is weak"
+                    else:
+                        status = "pass"
+                        explanation = "Required description structure is present"
+
+                    if description_zones:
+                        page_number = description_zones[0].get("page_start")
+
+            # Rule: FINANCIAL_COMPLETENESS
+            elif item.rule_code == "FINANCIAL_COMPLETENESS":
+                main_file = self._primary_file(files_by_lang, files)
+                if not main_file:
+                    status = "fail"
+                    explanation = "No files available for financial completeness validation"
+                    package_evidence = "Package contains no files."
+                else:
+                    structure = self._safe_structure(main_file)
+                    metadata = structure.get("metadata") if isinstance(structure.get("metadata"), dict) else {}
+                    financial = metadata.get("financial_summary") if isinstance(metadata, dict) else {}
+                    financial = financial if isinstance(financial, dict) else {}
+
+                    total = financial.get("total_requested_funding")
+                    yearly = financial.get("yearly_breakdown") if isinstance(financial.get("yearly_breakdown"), list) else []
+                    stages = financial.get("stage_breakdown") if isinstance(financial.get("stage_breakdown"), list) else []
+                    families = set(self._table_families(main_file))
+                    has_summary_tbl = "financial_funding_summary" in families
+                    has_stage_tbl = "financial_stage_amounts" in families
+
+                    checks = {
+                        "financial_summary.total_requested_funding": isinstance(total, int) and total > 0,
+                        "financial_summary.yearly_breakdown": len(yearly) > 0,
+                        "financial_summary.stage_breakdown": len(stages) > 0,
+                        "table_family.financial_funding_summary": has_summary_tbl,
+                        "table_family.financial_stage_amounts": has_stage_tbl,
+                    }
+                    ok_count = sum(1 for v in checks.values() if v)
+                    package_evidence = (
+                        "Source: "
+                        f"total={total}, yearly_count={len(yearly)}, stage_count={len(stages)}, "
+                        f"table_families={sorted(families)}"
+                    )
+
+                    if ok_count == len(checks):
+                        status = "pass"
+                        explanation = "Financial summary and stage completeness checks passed"
+                    elif ok_count == 0:
+                        status = "fail"
+                        explanation = "Financial summary/stage data missing"
+                    else:
+                        status = "review"
+                        missing = [k for k, v in checks.items() if not v]
+                        explanation = f"Financial data partially complete; missing: {', '.join(missing)}"
+
+            # Rule: ANNEX_CERTIFICATE_STATUS
+            elif item.rule_code == "ANNEX_CERTIFICATE_STATUS":
+                main_file = self._primary_file(files_by_lang, files)
+                if not main_file:
+                    status = "fail"
+                    explanation = "No files available for annex/certificate status validation"
+                    package_evidence = "Package contains no files."
+                else:
+                    structure = self._safe_structure(main_file)
+                    annex_zones = self._zones_by_type(structure, "annex")
+                    cert_zones = self._zones_by_type(structure, "certificate")
+                    relevant_zones = annex_zones + cert_zones
+                    page_classes = self._page_classes(main_file)
+                    routed_scanned_pages: List[int] = []
+
+                    for z in relevant_zones:
+                        p0 = z.get("page_start")
+                        p1 = z.get("page_end")
+                        if not isinstance(p0, int) or not isinstance(p1, int):
+                            continue
+                        for p in range(p0, p1 + 1):
+                            if page_classes.get(p) == "scanned_image_only":
+                                routed_scanned_pages.append(p)
+
+                    routed_scanned_pages = sorted(set(routed_scanned_pages))
+                    package_evidence = (
+                        f"Source: annex_zones={len(annex_zones)}, certificate_zones={len(cert_zones)}, "
+                        f"scanned_image_only_pages={routed_scanned_pages}"
+                    )
+
+                    if not relevant_zones:
+                        status = "fail"
+                        explanation = "Annex/certificate zones are missing"
+                    elif routed_scanned_pages:
+                        status = "review"
+                        explanation = "Annex/certificate pages present; scanned pages require manual confirmation"
+                    else:
+                        status = "pass"
+                        explanation = "Annex/certificate presence check passed on native-text pages"
             
             # Extract source passage if source document is available
             source_passage = None
