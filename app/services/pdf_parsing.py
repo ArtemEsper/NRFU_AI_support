@@ -5,6 +5,7 @@ import os
 import tempfile
 import json
 import logging
+from collections import Counter
 from datetime import datetime, timezone
 from uuid import uuid4
 from app.core.logger import logger
@@ -161,8 +162,12 @@ class PdfParsingService:
         page_table_classifications = self._classify_pages_for_tables(doc, pages_text)
         # Deterministic Zone/Section Reconstruction
         structure = self._reconstruct_structure(doc, pages_text, full_text, page_table_classifications)
-        if settings.USE_LITEPARSE_SCANNED_TABLE_ROUTING:
-            self._augment_scanned_tables_with_liteparse(file_content, structure, pages_text)
+        self._augment_scanned_tables_with_liteparse(
+            file_content,
+            structure,
+            pages_text,
+            enable_financial_detail_routing=settings.USE_LITEPARSE_SCANNED_TABLE_ROUTING,
+        )
         
         page_map: Dict[int, List[str]] = {}
         for zone in structure.zones:
@@ -1992,7 +1997,12 @@ class PdfParsingService:
         file_content: bytes,
         structure: ParsedDocumentStructure,
         pages_text: Optional[List[str]] = None,
+        enable_financial_detail_routing: bool = False,
     ):
+        def _finalize_scanned_quality() -> None:
+            self._annotate_scanned_quality_assessment(structure, pages_text)
+            self._refresh_annex_status_from_evidence(structure, pages_text)
+
         def _zone_for_page(page_number: int) -> Optional[str]:
             zone = next(
                 (z for z in structure.zones if z.page_start <= page_number <= (z.page_end or z.page_start)),
@@ -2009,16 +2019,22 @@ class PdfParsingService:
             if zone_type == "annex":
                 routed_specs.append({"page_number": cls.page_number, "route_family": "annex_scanned"})
                 continue
-            if zone_type == "description" and self._is_financial_detail_candidate_page(cls.page_number, pages_text):
+            if (
+                enable_financial_detail_routing
+                and zone_type == "description"
+                and self._is_financial_detail_candidate_page(cls.page_number, pages_text)
+            ):
                 routed_specs.append({"page_number": cls.page_number, "route_family": "financial_detail_scanned"})
 
         if not routed_specs:
+            _finalize_scanned_quality()
             return
 
         if not self.enrichment_service.cli_available:
             if not structure.metadata:
                 structure.metadata = {}
             structure.metadata["liteparse_scanned_routing_warning"] = "LiteParse CLI not available; scanned routing skipped."
+            _finalize_scanned_quality()
             return
 
         page_numbers = sorted({int(spec["page_number"]) for spec in routed_specs})
@@ -2037,6 +2053,7 @@ class PdfParsingService:
             if not structure.metadata:
                 structure.metadata = {}
             structure.metadata["liteparse_scanned_routing_warning"] = f"LiteParse scanned routing failed: {exc}"
+            _finalize_scanned_quality()
             return
         finally:
             if os.path.exists(tmp_path):
@@ -2174,8 +2191,445 @@ class PdfParsingService:
                 )
             ]
             structure.tables.append(scanned_table)
+            if route_family == "annex_scanned":
+                self._upsert_annex_scanned_evidence_block(
+                    structure=structure,
+                    page_num=page_num,
+                    raw_text=raw_text,
+                    extraction_mode=extraction_mode,
+                    grouped=grouped,
+                    row_count=len(rows),
+                    column_count=len(columns),
+                    warnings=warnings,
+                )
 
         self._suppress_routed_financial_detail_paragraphs(structure, financial_detail_pages)
+        _finalize_scanned_quality()
+
+    def _annotate_scanned_quality_assessment(
+        self,
+        structure: ParsedDocumentStructure,
+        pages_text: Optional[List[str]] = None,
+    ) -> None:
+        pages_text = pages_text or []
+
+        class_by_page: Dict[int, TablePageClassification] = {
+            c.page_number: c for c in (structure.page_table_classifications or [])
+            if c.page_class == "scanned_image_only"
+        }
+        if not class_by_page:
+            return
+
+        zone_by_page: Dict[int, str] = {}
+        for z in structure.zones:
+            for p in range(z.page_start, (z.page_end or z.page_start) + 1):
+                zone_by_page[p] = z.zone_type
+
+        scanned_tables = [
+            t for t in (structure.tables or [])
+            if t.table_family in {
+                "scanned_page_ocr_layout",
+                "scanned_financial_detail_ocr_layout",
+                "scanned_financial_detail_continuation_placeholder",
+                "scanned_native_table_terminal_continuation_placeholder",
+            }
+        ]
+        table_by_page: Dict[int, CanonicalTable] = {}
+        for t in scanned_tables:
+            for p in range(int(t.page_start or 0), int((t.page_end or t.page_start) or 0) + 1):
+                if p not in table_by_page:
+                    table_by_page[p] = t
+
+        pages_sorted = sorted(class_by_page.keys())
+        family_pages: Dict[str, List[int]] = {}
+        for p in pages_sorted:
+            zone_type = zone_by_page.get(p, "unknown")
+            table = table_by_page.get(p)
+            if table:
+                key = f"{zone_type}:{table.table_family}"
+            else:
+                hint = (class_by_page[p].signals or {}).get("scanned_family_hint") or "unclassified"
+                key = f"{zone_type}:scanned_hint:{hint}"
+            family_pages.setdefault(key, []).append(p)
+
+        def _build_contiguous_runs(pages: List[int]) -> List[List[int]]:
+            if not pages:
+                return []
+            out: List[List[int]] = []
+            run: List[int] = [pages[0]]
+            for p in pages[1:]:
+                if p == run[-1] + 1:
+                    run.append(p)
+                else:
+                    out.append(run)
+                    run = [p]
+            out.append(run)
+            return out
+
+        family_run_by_page: Dict[int, Dict[str, Any]] = {}
+        for family_key, members in family_pages.items():
+            for run_idx, run in enumerate(_build_contiguous_runs(sorted(set(members))), start=1):
+                run_id = f"{family_key}:run_{run_idx:02d}"
+                for p in run:
+                    family_run_by_page[p] = {
+                        "family_key": family_key,
+                        "family_run_id": run_id,
+                        "members": run,
+                    }
+
+        recommendation_rank = {
+            "accept_local": 0,
+            "accept_local_with_warning": 1,
+            "external_fallback_candidate": 2,
+        }
+        page_assessments: Dict[int, Dict[str, Any]] = {}
+        family_assessments_acc: Dict[str, List[Dict[str, Any]]] = {}
+
+        for p in pages_sorted:
+            cls = class_by_page[p]
+            sig = dict(cls.signals or {})
+            table = table_by_page.get(p)
+            fam = family_run_by_page.get(p, {"family_key": "unknown", "family_run_id": "unknown", "members": [p]})
+            members = fam.get("members") or [p]
+
+            reasons: List[str] = []
+            ocr_len = int(sig.get("scanned_family_ocr_text_len", 0) or 0)
+            ocr_source = str(sig.get("scanned_family_text_source") or "")
+            page_text = ""
+            for z in structure.zones:
+                for b in z.blocks:
+                    if b.page_number != p:
+                        continue
+                    meta = dict(b.metadata or {})
+                    if meta.get("evidence_type") == "annex_scanned_ocr_text":
+                        page_text = str(b.text or "")
+                        break
+                if page_text:
+                    break
+            if not page_text and table:
+                page_text = "\n".join(
+                    " ".join(str(getattr(c, "text", "") or "").strip() for c in (r.cells or []))
+                    for r in (table.rows or [])
+                )
+
+            token_re = re.compile(r"[A-Za-zА-Яа-яІіЇїЄєҐґ0-9]+")
+            tokens_raw = token_re.findall(page_text)
+            token_count = len(tokens_raw)
+            non_space_chars = [ch for ch in page_text if not ch.isspace()]
+            non_space_count = len(non_space_chars)
+            alnum_count = sum(1 for ch in non_space_chars if ch.isalnum())
+            alnum_ratio = (alnum_count / float(non_space_count)) if non_space_count > 0 else 0.0
+
+            plausible_tokens = 0
+            single_char_tokens = 0
+            norm_tokens: List[str] = []
+            for tok in tokens_raw:
+                norm = tok.lower().strip()
+                if not norm:
+                    continue
+                norm_tokens.append(norm)
+                if len(norm) == 1:
+                    single_char_tokens += 1
+                alpha_count = sum(1 for ch in norm if ch.isalpha())
+                digit_count = sum(1 for ch in norm if ch.isdigit())
+                if len(norm) >= 2 and alpha_count >= 2 and digit_count <= int(len(norm) * 0.5):
+                    plausible_tokens += 1
+            plausible_ratio = (plausible_tokens / float(token_count)) if token_count > 0 else 0.0
+            single_char_ratio = (single_char_tokens / float(token_count)) if token_count > 0 else 1.0
+
+            repeat_ratio = 0.0
+            if norm_tokens:
+                token_freq = Counter(norm_tokens)
+                repeated_small = sum(v for k, v in token_freq.items() if len(k) <= 3 and v >= 4)
+                repeat_ratio = repeated_small / float(len(norm_tokens))
+
+            lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+            if not lines:
+                line_sanity = 0.0
+            else:
+                long_lines = sum(1 for ln in lines if len(ln) >= 12)
+                short_fragment_lines = sum(1 for ln in lines if len(ln) <= 2)
+                line_sanity = (
+                    0.7 * (long_lines / float(len(lines)))
+                    + 0.3 * (1.0 - min(1.0, short_fragment_lines / float(len(lines))))
+                )
+                line_sanity = max(0.0, min(1.0, line_sanity))
+
+            readability_score = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.35 * plausible_ratio)
+                    + (0.25 * alnum_ratio)
+                    + (0.15 * (1.0 - min(1.0, single_char_ratio)))
+                    + (0.15 * (1.0 - min(1.0, repeat_ratio)))
+                    + (0.10 * line_sanity),
+                ),
+            )
+
+            if ocr_len <= 0:
+                ocr_quality = 0.0
+                reasons.append("low_ocr_text_coverage")
+            else:
+                volume_score = min(1.0, 0.25 + min(float(ocr_len), 1400.0) / 1400.0 * 0.75)
+                ocr_quality = max(0.0, min(1.0, volume_score * (readability_score ** 1.2)))
+                if ocr_len < 160:
+                    reasons.append("low_ocr_text_coverage")
+                if ocr_source not in {"liteparse_ocr_snippet", "native_extracted_text"}:
+                    reasons.append("unknown_ocr_source")
+                if readability_score < 0.35:
+                    reasons.append("low_ocr_readability")
+                    ocr_quality = min(ocr_quality, 0.35)
+                if readability_score < 0.2:
+                    ocr_quality = min(ocr_quality, 0.2)
+
+            row_count = 0
+            col_count = 0
+            warnings: List[str] = []
+            header_rows: List[int] = []
+            semantic_meta: Dict[str, Any] = {}
+            inconsistent_row_structure = False
+            sparse_row_ratio = 1.0
+            fragment_row_ratio = 1.0
+            row_fill_stability = 0.0
+            fill_density = 0.0
+            if table:
+                row_count = int((table.validation or {}).get("row_count", len(table.rows or [])) or 0)
+                col_count = int((table.validation or {}).get("column_count", len(table.columns or [])) or 0)
+                warnings = list((table.source or {}).get("warnings") or [])
+                warnings += list((table.validation or {}).get("normalization_warnings") or [])
+                header_rows = list((table.validation or {}).get("header_row_indices") or [])
+                semantic_meta = dict((table.validation or {}).get("semantic_mapping") or {})
+                filled_cells = [
+                    sum(1 for c in (r.cells or []) if str(getattr(c, "text", "") or "").strip())
+                    for r in (table.rows or [])
+                ]
+                if filled_cells and (max(filled_cells) - min(filled_cells) >= 2):
+                    inconsistent_row_structure = True
+                if filled_cells and col_count > 0:
+                    sparse_rows = sum(1 for fc in filled_cells if fc <= 1)
+                    sparse_row_ratio = sparse_rows / float(len(filled_cells))
+                    fill_density = sum(filled_cells) / float(len(filled_cells) * col_count)
+                    row_span = (max(filled_cells) - min(filled_cells)) / float(max(1, col_count))
+                    row_fill_stability = max(0.0, min(1.0, 1.0 - row_span))
+                row_fragment_count = 0
+                if table.rows:
+                    for r in table.rows:
+                        cells_text = " ".join(str(getattr(c, "text", "") or "").strip() for c in (r.cells or []))
+                        rtoks = token_re.findall(cells_text)
+                        if not rtoks:
+                            row_fragment_count += 1
+                            continue
+                        short_tokens = sum(1 for t in rtoks if len(t) <= 2)
+                        if (short_tokens / float(len(rtoks))) >= 0.65:
+                            row_fragment_count += 1
+                    fragment_row_ratio = row_fragment_count / float(len(table.rows))
+
+            if table:
+                row_score = min(1.0, row_count / 24.0)
+                if col_count >= 4:
+                    col_score = 1.0
+                elif col_count == 3:
+                    col_score = 0.85
+                elif col_count == 2:
+                    col_score = 0.55
+                else:
+                    col_score = 0.2
+                warning_penalty = min(0.5, 0.12 * float(len(set(warnings))))
+                structure_penalty = 0.12 * sparse_row_ratio + 0.1 * fragment_row_ratio
+                table_quality = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (0.32 * row_score)
+                        + (0.18 * col_score)
+                        + (0.3 * fill_density)
+                        + (0.2 * row_fill_stability)
+                        - warning_penalty
+                        - structure_penalty,
+                    ),
+                )
+                if row_count < 6:
+                    reasons.append("low_row_coverage")
+                if col_count < 3:
+                    reasons.append("low_field_coverage")
+                if sparse_row_ratio >= 0.5:
+                    reasons.append("row_sparsity_high")
+                if fragment_row_ratio >= 0.45:
+                    reasons.append("fragment_heavy_rows")
+            else:
+                table_quality = 0.0
+                reasons.append("missing_table_object")
+
+            semantic_conf = float(semantic_meta.get("confidence", 0.0) or 0.0)
+            semantic_applied = bool(semantic_meta.get("applied"))
+            if semantic_applied:
+                semantic_quality = max(0.55, semantic_conf)
+            else:
+                semantic_quality = min(0.25, max(0.0, semantic_conf))
+
+            warning_set = {str(w) for w in warnings}
+            if any(w.startswith("semantic_mapping_weak") for w in warning_set):
+                reasons.append("semantic_mapping_weak")
+                semantic_quality = max(0.0, semantic_quality - 0.2)
+            if ("semantic_mapping_weak_no_header" in warning_set) or (not header_rows):
+                reasons.append("no_header_detected")
+                semantic_quality = max(0.0, semantic_quality - 0.15)
+            if inconsistent_row_structure:
+                reasons.append("inconsistent_row_structure")
+                table_quality = max(0.0, table_quality - 0.2)
+            if not semantic_applied and col_count >= 3:
+                reasons.append("low_field_coverage")
+            if not header_rows:
+                table_quality = min(table_quality, 0.35)
+            if not semantic_applied:
+                table_quality = min(table_quality, 0.55)
+
+            continuity_matches = 0
+            continuity_strong = 0
+            for nei in (p - 1, p + 1):
+                if nei not in class_by_page:
+                    continue
+                nei_fam = family_run_by_page.get(nei)
+                if nei_fam and nei_fam.get("family_run_id") == fam.get("family_run_id"):
+                    continuity_matches += 1
+                    nei_table = table_by_page.get(nei)
+                    if table and nei_table:
+                        nei_rows = int((nei_table.validation or {}).get("row_count", len(nei_table.rows or [])) or 0)
+                        if row_count > 0 and nei_rows > 0:
+                            ratio = abs(nei_rows - row_count) / float(max(nei_rows, row_count))
+                            if ratio <= 0.6:
+                                continuity_strong += 1
+
+            if continuity_matches == 0:
+                continuity_quality_raw = 0.35
+            else:
+                continuity_quality_raw = min(1.0, 0.55 + (0.2 * continuity_matches) + (0.15 * continuity_strong))
+            if semantic_quality < 0.2:
+                continuity_quality = min(0.25, continuity_quality_raw * 0.3)
+            elif semantic_quality < 0.5:
+                continuity_quality = min(0.45, continuity_quality_raw * 0.6)
+            else:
+                continuity_quality = continuity_quality_raw
+
+            overall_quality = (
+                (0.35 * ocr_quality)
+                + (0.3 * table_quality)
+                + (0.3 * semantic_quality)
+                + (0.05 * continuity_quality)
+            )
+            overall_quality = max(0.0, min(1.0, overall_quality))
+
+            if semantic_quality <= 0.05:
+                overall_quality = min(overall_quality, 0.25)
+            elif semantic_quality < 0.2:
+                overall_quality = min(overall_quality, 0.38)
+            if "no_header_detected" in reasons:
+                overall_quality = min(overall_quality, 0.45)
+
+            trust_penalties = {
+                "semantic_mapping_weak": 0.12,
+                "no_header_detected": 0.1,
+                "low_field_coverage": 0.08,
+                "inconsistent_row_structure": 0.08,
+                "low_ocr_text_coverage": 0.1,
+                "low_ocr_readability": 0.12,
+                "row_sparsity_high": 0.06,
+                "fragment_heavy_rows": 0.06,
+                "missing_table_object": 0.12,
+                "low_row_coverage": 0.06,
+            }
+            trust_penalty_total = min(0.45, sum(trust_penalties.get(r, 0.0) for r in set(reasons)))
+            overall_quality = max(0.0, overall_quality - trust_penalty_total)
+
+            unique_reasons = list(dict.fromkeys(reasons))
+            if overall_quality >= 0.65 and not unique_reasons:
+                recommendation = "accept_local"
+            elif overall_quality >= 0.45:
+                recommendation = "accept_local_with_warning"
+            else:
+                recommendation = "external_fallback_candidate"
+
+            assessment = {
+                "quality_version": "scanned_quality_v1",
+                "ocr_quality_score": round(ocr_quality, 3),
+                "ocr_readability_score": round(readability_score, 3),
+                "table_quality_score": round(table_quality, 3),
+                "semantic_quality_score": round(semantic_quality, 3),
+                "cross_page_continuity_score": round(continuity_quality, 3),
+                "overall_quality_score": round(overall_quality, 3),
+                "routing_recommendation": recommendation,
+                "reasons": unique_reasons,
+                "family_key": fam.get("family_key"),
+                "family_run_id": fam.get("family_run_id"),
+            }
+            page_assessments[p] = assessment
+
+            sig["scanned_quality_assessment"] = assessment
+            cls.signals = sig
+
+            if table:
+                src = dict(table.source or {})
+                src["quality_assessment"] = assessment
+                table.source = src
+
+            for z in structure.zones:
+                for b in z.blocks:
+                    if b.page_number != p:
+                        continue
+                    meta = dict(b.metadata or {})
+                    if meta.get("evidence_type") == "annex_scanned_ocr_text":
+                        meta["quality_assessment"] = assessment
+                        b.metadata = meta
+
+            family_assessments_acc.setdefault(str(fam.get("family_run_id")), []).append(assessment)
+
+        family_assessments: List[Dict[str, Any]] = []
+        external_candidates: List[Dict[str, Any]] = []
+        for run_id, items in family_assessments_acc.items():
+            if not items:
+                continue
+            pages = sorted(
+                p for p, a in page_assessments.items()
+                if a.get("family_run_id") == run_id
+            )
+            avg_ocr = sum(float(a.get("ocr_quality_score", 0.0)) for a in items) / len(items)
+            avg_table = sum(float(a.get("table_quality_score", 0.0)) for a in items) / len(items)
+            avg_sem = sum(float(a.get("semantic_quality_score", 0.0)) for a in items) / len(items)
+            avg_overall = sum(float(a.get("overall_quality_score", 0.0)) for a in items) / len(items)
+            worst = max(items, key=lambda a: recommendation_rank.get(str(a.get("routing_recommendation")), 0))
+            reason_counts: Dict[str, int] = {}
+            for a in items:
+                for r in a.get("reasons") or []:
+                    reason_counts[r] = reason_counts.get(r, 0) + 1
+            family_reasons = [r for r, _ in sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+            fam_info = {
+                "family_run_id": run_id,
+                "family_key": items[0].get("family_key"),
+                "pages": pages,
+                "ocr_quality_score": round(avg_ocr, 3),
+                "table_quality_score": round(avg_table, 3),
+                "semantic_quality_score": round(avg_sem, 3),
+                "overall_quality_score": round(avg_overall, 3),
+                "routing_recommendation": worst.get("routing_recommendation"),
+                "reasons": family_reasons,
+            }
+            family_assessments.append(fam_info)
+            if fam_info["routing_recommendation"] == "external_fallback_candidate":
+                external_candidates.append(fam_info)
+
+        if not structure.metadata:
+            structure.metadata = {}
+        structure.metadata["scanned_quality_assessment"] = {
+            "quality_version": "scanned_quality_v1",
+            "page_count": len(page_assessments),
+            "pages": {str(k): v for k, v in sorted(page_assessments.items())},
+            "families": sorted(family_assessments, key=lambda x: (x.get("pages") or [999999])[0]),
+            "external_fallback_candidates": sorted(
+                external_candidates,
+                key=lambda x: (-float(x.get("overall_quality_score", 0.0)), (x.get("pages") or [999999])[0]),
+            ),
+        }
 
     def _reconstruct_structure(
         self,
@@ -3895,34 +4349,12 @@ class PdfParsingService:
             elif text == "Довідки":
                 certificate_marker_pages.append(anchor.get("page"))
 
-        zone_pages = list(range(zone.page_start, zone.page_end + 1))
-        empty_content_pages = []
-        content_text_pages = []
-        page_status = []
-        for p in zone_pages:
-            page_text = pages[p - 1] if 0 <= (p - 1) < len(pages) else ""
-            has_text = bool(page_text and page_text.strip())
-            if has_text:
-                content_text_pages.append(p)
-                page_status.append({"page": p, "status": "text_content_detected"})
-            else:
-                empty_content_pages.append(p)
-                page_status.append({"page": p, "status": "no_text_extracted"})
-
-        annex_status = {
-            "semantics_mode": "single_zone_labeled_by_markers",
-            "marker_pages": {
-                "annex": sorted([p for p in annex_marker_pages if isinstance(p, int)]),
-                "certificate": sorted([p for p in certificate_marker_pages if isinstance(p, int)]),
-            },
-            "zone_pages": zone_pages,
-            "content_text_pages": content_text_pages,
-            "no_text_extracted_pages": empty_content_pages,
-            "page_status": page_status,
-            "marker_only_detected": bool(sorted(set(marker_pages) & set(annex_marker_pages + certificate_marker_pages))),
-            "no_text_extracted": len(content_text_pages) == 0,
-            "scanned_or_image_only_suspected": len(content_text_pages) == 0 and len(zone_pages) > 0,
+        annex_status = self._build_annex_status(zone, pages, structure)
+        annex_status["marker_pages"] = {
+            "annex": sorted([p for p in annex_marker_pages if isinstance(p, int)]),
+            "certificate": sorted([p for p in certificate_marker_pages if isinstance(p, int)]),
         }
+        annex_status["marker_only_detected"] = bool(sorted(set(marker_pages) & set(annex_marker_pages + certificate_marker_pages)))
 
         structure.metadata["annex_subtypes"] = annexes
         structure.metadata["annex_status"] = annex_status
@@ -3934,6 +4366,170 @@ class PdfParsingService:
                     "annex_subtypes": annexes,
                     "annex_status": annex_status
                 }
+
+    def _build_annex_status(
+        self,
+        zone: DocumentZone,
+        pages: List[str],
+        structure: ParsedDocumentStructure,
+    ) -> Dict[str, Any]:
+        zone_pages = list(range(zone.page_start, zone.page_end + 1))
+        content_text_pages: List[int] = []
+        content_evidence_pages: List[int] = []
+        no_text_pages_raw: List[int] = []
+        no_text_extracted_pages: List[int] = []
+        page_status: List[Dict[str, Any]] = []
+
+        page_cls_by_num: Dict[int, TablePageClassification] = {
+            int(c.page_number): c for c in (structure.page_table_classifications or [])
+        }
+        annex_table_pages: Set[int] = set()
+        for t in structure.tables or []:
+            if t.zone_type != "annex":
+                continue
+            annex_table_pages.update(range(int(t.page_start), int(t.page_end) + 1))
+
+        for p in zone_pages:
+            page_text = pages[p - 1] if 0 <= (p - 1) < len(pages) else ""
+            has_text = bool(page_text and page_text.strip())
+            if has_text:
+                content_text_pages.append(p)
+            else:
+                no_text_pages_raw.append(p)
+
+            cls = page_cls_by_num.get(p)
+            signals = cls.signals or {} if cls else {}
+            quality_assessment = signals.get("scanned_quality_assessment") or {}
+            has_ocr_text = bool(
+                int(signals.get("scanned_family_ocr_text_len", 0) or 0) > 0
+                and signals.get("scanned_family_text_source") == "liteparse_ocr_snippet"
+            )
+            has_table_object = p in annex_table_pages
+            cert_ev = signals.get("certificate_reference_evidence") or {}
+            has_certificate_evidence = bool(cert_ev.get("is_certificate_reference"))
+            has_content_evidence = bool(has_text or has_ocr_text or has_table_object or has_certificate_evidence)
+
+            evidence_types: List[str] = []
+            if has_text:
+                evidence_types.append("native_text")
+            if has_ocr_text:
+                evidence_types.append("ocr_text")
+            if has_table_object:
+                evidence_types.append("table_object")
+            if has_certificate_evidence:
+                evidence_types.append("certificate_reference")
+
+            status = "content_evidence_detected" if has_content_evidence else "no_text_extracted"
+            if has_content_evidence:
+                content_evidence_pages.append(p)
+            else:
+                no_text_extracted_pages.append(p)
+
+            page_status.append({
+                "page": p,
+                "status": status,
+                "has_text": has_text,
+                "has_ocr_text": has_ocr_text,
+                "has_table_object": has_table_object,
+                "has_certificate_evidence": has_certificate_evidence,
+                "evidence_types": evidence_types,
+                "quality_assessment": quality_assessment if quality_assessment else None,
+            })
+
+        return {
+            "semantics_mode": "single_zone_labeled_by_markers",
+            "marker_pages": {"annex": [], "certificate": []},
+            "zone_pages": zone_pages,
+            "content_text_pages": content_text_pages,
+            "content_evidence_pages": content_evidence_pages,
+            "no_text_pages_raw": no_text_pages_raw,
+            "no_text_extracted_pages": no_text_extracted_pages,
+            "page_status": page_status,
+            "marker_only_detected": False,
+            "no_text_extracted": len(content_evidence_pages) == 0,
+            "scanned_or_image_only_suspected": len(content_evidence_pages) == 0 and len(zone_pages) > 0,
+        }
+
+    def _refresh_annex_status_from_evidence(
+        self,
+        structure: ParsedDocumentStructure,
+        pages: List[str],
+    ) -> None:
+        annex_zone = next((z for z in structure.zones if z.zone_type == "annex"), None)
+        if not annex_zone:
+            return
+        if not structure.metadata:
+            structure.metadata = {}
+
+        current = structure.metadata.get("annex_status") if isinstance(structure.metadata, dict) else None
+        refreshed = self._build_annex_status(annex_zone, pages, structure)
+
+        if isinstance(current, dict):
+            marker_pages = current.get("marker_pages")
+            if isinstance(marker_pages, dict):
+                refreshed["marker_pages"] = marker_pages
+            if "marker_only_detected" in current:
+                refreshed["marker_only_detected"] = bool(current.get("marker_only_detected"))
+
+        structure.metadata["annex_status"] = refreshed
+
+        for block in annex_zone.blocks:
+            if block.block_type == "scan_block":
+                meta = dict(block.metadata or {})
+                meta["annex_status"] = refreshed
+                block.metadata = meta
+
+    def _upsert_annex_scanned_evidence_block(
+        self,
+        structure: ParsedDocumentStructure,
+        page_num: int,
+        raw_text: str,
+        extraction_mode: str,
+        grouped: bool,
+        row_count: int,
+        column_count: int,
+        warnings: List[str],
+    ) -> None:
+        zone = next(
+            (z for z in structure.zones if z.zone_type == "annex" and z.page_start <= page_num <= (z.page_end or z.page_start)),
+            None,
+        )
+        if not zone:
+            return
+        text = (raw_text or "").strip()
+        if not text:
+            return
+
+        metadata = {
+            "evidence_type": "annex_scanned_ocr_text",
+            "source": "liteparse_cli",
+            "extraction_mode": extraction_mode,
+            "table_like_layout_detected": bool(grouped),
+            "row_count": int(row_count),
+            "column_count": int(column_count),
+            "warnings": list(warnings or []),
+        }
+
+        block = DocumentBlock(
+            block_type="paragraph",
+            text=text,
+            page_number=page_num,
+            metadata=metadata,
+        )
+        existing = next(
+            (
+                b for b in zone.blocks
+                if b.page_number == page_num
+                and b.metadata
+                and b.metadata.get("evidence_type") == "annex_scanned_ocr_text"
+            ),
+            None,
+        )
+        if existing:
+            existing.text = text
+            existing.metadata = metadata
+        else:
+            zone.blocks.append(block)
 
     def _recursive_clean_blocks(self, section: DocumentSection):
         """Recursively clean blocks in section and its subsections."""
@@ -4066,11 +4662,16 @@ class PdfParsingService:
             c.page_number: (c.signals or {}).get("scanned_family_confidence")
             for c in structure.page_table_classifications
         }
+        page_quality: Dict[int, Dict[str, Any]] = {
+            c.page_number: dict((c.signals or {}).get("scanned_quality_assessment") or {})
+            for c in structure.page_table_classifications
+        }
 
         all_pages: Set[int] = set(page_zone.keys()) | set(page_blocks.keys()) | set(page_tables.keys()) | set(page_class.keys())
         rows: List[Dict[str, Any]] = []
         for p in sorted(all_pages):
             table_meta = page_tables.get(p, {"table_families": [], "table_ids": []})
+            quality = page_quality.get(p) or {}
             rows.append({
                 "page_number": p,
                 "zone_type": page_zone.get(p),
@@ -4081,6 +4682,12 @@ class PdfParsingService:
                 "has_table_object": bool(table_meta["table_ids"]),
                 "table_families": sorted(table_meta["table_families"]),
                 "table_ids": sorted(table_meta["table_ids"]),
+                "ocr_quality_score": quality.get("ocr_quality_score"),
+                "table_quality_score": quality.get("table_quality_score"),
+                "semantic_quality_score": quality.get("semantic_quality_score"),
+                "overall_quality_score": quality.get("overall_quality_score"),
+                "routing_recommendation": quality.get("routing_recommendation"),
+                "quality_reasons": quality.get("reasons") or [],
             })
 
         return {
